@@ -259,7 +259,7 @@ export default function AttendancePage() {
                   disabled={isFuture}
                   className={`min-h-[60px] p-1.5 rounded-lg text-left transition-all border ${
                     isSelected
-                      ? 'border-primary bg-accent_light shadow-sm'
+                      ? 'border-primary bg-accent-light shadow-sm'
                       : isToday
                       ? 'border-primary/40 bg-background'
                       : 'border-transparent hover:border-border hover:bg-background'

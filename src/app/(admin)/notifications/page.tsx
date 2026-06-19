@@ -98,7 +98,7 @@ export default function NotificationsPage() {
       const h = await getSentNotifications();
       setHistory(h);
     } catch (e) {
-      setError('Failed to send notification. Please try again.');
+      setError(e instanceof Error ? e.message : 'Failed to send notification.');
       console.error(e);
     } finally {
       setSending(false);

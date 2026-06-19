@@ -214,15 +214,13 @@ export async function sendNotification(
   const batch  = writeBatch(db);
   const sentAt = Timestamp.now();
 
-  // Write one notification doc per recipient
   for (const userId of userIds) {
     const notifRef = doc(collection(db, 'users', userId, 'notifications'));
     batch.set(notifRef, { title, body, type, isRead: false, createdAt: sentAt });
   }
 
-  // Log the send event for history
   const logRef = doc(collection(db, 'sent_notifications'));
-  batch.set(logRef, {
+  const logData: Record<string, unknown> = {
     title,
     body,
     type,
@@ -230,7 +228,11 @@ export async function sendNotification(
     recipientCount: userIds.length,
     sentByName: senderName,
     sentAt,
-  });
+  };
+  if (recipientType === 'specific' && userIds.length === 1) {
+    logData.recipientId = userIds[0];
+  }
+  batch.set(logRef, logData);
 
   await batch.commit();
 }

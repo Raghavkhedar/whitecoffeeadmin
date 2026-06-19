@@ -1,7 +1,6 @@
 const { setGlobalOptions } = require("firebase-functions");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
-const { onRequest } = require("firebase-functions/v2/https");
 const { defineSecret } = require("firebase-functions/params");
 const admin = require("firebase-admin");
 const { google } = require("googleapis");
@@ -388,7 +387,12 @@ exports.exportToSheets = onSchedule(
       const grouped = new Map();
       attendSnap.docs.forEach((doc) => {
         const d = doc.data();
-        if (!opsUsers.has(d.userId) || !d.latitude || !d.longitude) return;
+        const user = opsUsers.get(d.userId);
+        if (!user) return;
+        const hasGPS  = d.latitude && d.longitude;
+        const isHome  = d.type === "home_in" || d.type === "home_out";
+        const hasHome = user.homeLat && user.homeLng;
+        if (!hasGPS && !(isHome && hasHome)) return;
         const key = `${d.userId}__${d.date}`;
         if (!grouped.has(key)) grouped.set(key, []);
         grouped.get(key).push(d);
@@ -625,104 +629,6 @@ exports.sendPushNotification = onDocumentCreated(
       console.log(`sendPushNotification: chunk ${Math.floor(i / CHUNK) + 1} — ${response.successCount}/${chunk.length} delivered`);
     }
     console.log(`sendPushNotification: done — ${totalSuccess}/${tokens.length} tokens reached`);
-  }
-);
-
-// ── One-time Backfill — DELETE after running ─────────────────────────────────
-// Hit this URL once in your browser to backfill attendance_status for the
-// current month (June 1 → today). Then delete this function and redeploy.
-exports.backfillAttendanceStatus = onRequest(
-  { timeoutSeconds: 540 },
-  async (req, res) => {
-    const db = admin.firestore();
-    const nowIST     = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
-    const year       = nowIST.getFullYear();
-    const month      = nowIST.getMonth(); // 0-indexed
-    const todayDate  = nowIST.getDate();
-    const monthStart = `${year}-${String(month + 1).padStart(2, "0")}-01`;
-    const todayStr   = nowIST.toISOString().slice(0, 10);
-
-    const usersSnap = await db.collection("users").get();
-    const allUsers  = usersSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-
-    const attendSnap = await db.collectionGroup("attendance")
-      .where("date", ">=", monthStart)
-      .where("date", "<=", todayStr)
-      .get();
-
-    const eventsByUserDate = new Map();
-    attendSnap.docs.forEach((doc) => {
-      const d   = doc.data();
-      const key = `${d.userId}__${d.date}`;
-      if (!eventsByUserDate.has(key)) eventsByUserDate.set(key, []);
-      eventsByUserDate.get(key).push(d);
-    });
-
-    const leavesSnap  = await db.collectionGroup("leave_requests").get();
-    const approvedLeaves = leavesSnap.docs.map((d) => d.data()).filter((d) => d.status === "approved");
-
-    let totalWrites = 0;
-    let batch = db.batch();
-    let batchCount = 0;
-
-    for (let day = 1; day <= todayDate; day++) {
-      const dateStr = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-
-      const leavesToday = new Map();
-      approvedLeaves.forEach((d) => {
-        if (d.fromDate <= dateStr && d.toDate >= dateStr) leavesToday.set(d.userId, d);
-      });
-
-      for (const user of allUsers) {
-        const key    = `${user.id}__${dateStr}`;
-        const events = (eventsByUserDate.get(key) || []).sort(
-          (a, b) => (a.timestamp?.seconds || 0) - (b.timestamp?.seconds || 0)
-        );
-
-        const isOps     = user.role === "operations";
-        const checkIns  = events.filter((e) => e.type === (isOps ? "home_in" : "office_in"));
-        const checkOuts = events.filter((e) => e.type === (isOps ? "home_out" : "office_out"));
-        let status;
-
-        if (checkIns.length > 0) {
-          const firstIn   = checkIns[0];
-          const lastOut   = checkOuts.length > 0 ? checkOuts[checkOuts.length - 1] : null;
-          const inMinutes = getHourIST(firstIn.timestamp) * 60 + getMinuteIST(firstIn.timestamp);
-          const lateIn    = inMinutes > 10 * 60;
-          let earlyOut    = true;
-          if (lastOut) {
-            const outMinutes = getHourIST(lastOut.timestamp) * 60 + getMinuteIST(lastOut.timestamp);
-            earlyOut = outMinutes < 18 * 60;
-          }
-          status = lateIn || earlyOut ? "HalfDay" : "Present";
-        } else {
-          const leave = leavesToday.get(user.id);
-          if (leave) {
-            status = (user.plBalance || 0) > 0 ? "PL" : "UPL";
-          } else {
-            status = "Absent";
-          }
-        }
-
-        batch.set(db.doc(`users/${user.id}/attendance_status/${dateStr}`), {
-          date: dateStr, userId: user.id, userName: user.name || "",
-          employeeId: user.employeeId || "", role: user.role || "", status,
-          markedBy: "backfill", updatedAt: admin.firestore.Timestamp.now(),
-        });
-        batchCount++;
-        totalWrites++;
-
-        if (batchCount >= 490) {
-          await batch.commit();
-          batch = db.batch();
-          batchCount = 0;
-        }
-      }
-    }
-
-    if (batchCount > 0) await batch.commit();
-    console.log(`backfillAttendanceStatus: ${totalWrites} records written for ${todayDate} days × ${allUsers.length} users`);
-    res.json({ success: true, records: totalWrites, days: todayDate, users: allUsers.length });
   }
 );
 
