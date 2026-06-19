@@ -14,6 +14,7 @@ const NAV = [
   { href: '/leaves',          icon: '🏖️', label: 'Leave Requests' },
   { href: '/regularization', icon: '🕐', label: 'Regularization' },
   { href: '/attendance',    icon: '📋', label: 'Attendance' },
+  { href: '/conveyance',    icon: '🚗', label: 'Conveyance' },
   { href: '/submissions',   icon: '📝', label: 'Submissions' },
   { href: '/notifications', icon: '🔔', label: 'Notifications' },
 ];

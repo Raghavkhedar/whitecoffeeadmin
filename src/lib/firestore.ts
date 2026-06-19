@@ -1,15 +1,14 @@
 'use client';
 
 import {
-  collection, collectionGroup, doc, getDocs,
+  collection, collectionGroup, doc, getDocs, getDoc,
   setDoc, updateDoc, deleteDoc, writeBatch,
   Timestamp, where, query, orderBy, limit,
-  // getDoc,  // used only by getDailyAssignments — re-enable when daily assignment system is re-enabled
 } from 'firebase/firestore';
 import { db } from './firebase';
 // Site removed from import — site management not in use
 // DailyAssignment, SiteAssignmentItem removed from import — daily assignment system not in use
-import type { User, LeaveRequest, AttendanceRecord, SentNotification, AttendanceStatus, RegularizationRequest } from '@/types';
+import type { User, LeaveRequest, AttendanceRecord, SentNotification, AttendanceStatus, RegularizationRequest, ConveyanceRecord } from '@/types';
 
 // ── Users ─────────────────────────────────────────────────────────────────
 
@@ -19,12 +18,24 @@ export async function getAllUsers(): Promise<User[]> {
 }
 
 export async function createUserProfile(uid: string, data: Omit<User, 'id'>) {
-  const { salaryRate, ...rest } = data;
-  await setDoc(doc(db, 'users', uid), { ...rest, salaryRate: salaryRate || 0, plBalance: 0, createdAt: Timestamp.now() });
+  const { salaryRate, homeLat, homeLng, conveyanceRateType, ...rest } = data;
+  await setDoc(doc(db, 'users', uid), {
+    ...rest,
+    salaryRate: salaryRate || 0,
+    homeLat: homeLat || null,
+    homeLng: homeLng || null,
+    conveyanceRateType: conveyanceRateType || null,
+    plBalance: 0,
+    createdAt: Timestamp.now(),
+  });
 }
 
 export async function updateUserProfile(uid: string, data: Partial<Omit<User, 'id'>>) {
-  await updateDoc(doc(db, 'users', uid), data as Record<string, unknown>);
+  const payload: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(data)) {
+    payload[k] = v === undefined ? null : v;
+  }
+  await updateDoc(doc(db, 'users', uid), payload);
 }
 
 export async function deleteUserProfile(uid: string) {
@@ -256,6 +267,28 @@ export async function setAttendanceStatus(
     { ...data, updatedAt: Timestamp.now() },
     { merge: true }
   );
+}
+
+// ── Conveyance Config ────────────────────────────────────────────────────
+
+export async function getConveyanceConfig(): Promise<{ rate1: number; rate2: number }> {
+  const snap = await getDoc(doc(db, 'config', 'conveyance'));
+  if (snap.exists()) {
+    const data = snap.data();
+    return { rate1: data.rate1 || 0, rate2: data.rate2 || 0 };
+  }
+  return { rate1: 0, rate2: 0 };
+}
+
+export async function setConveyanceConfig(rate1: number, rate2: number): Promise<void> {
+  await setDoc(doc(db, 'config', 'conveyance'), { rate1, rate2 });
+}
+
+// ── Conveyance Records ──────────────────────────────────────────────────
+
+export async function getConveyanceForMonth(month: string): Promise<ConveyanceRecord[]> {
+  const snap = await getDocs(query(collection(db, 'conveyance'), where('month', '==', month)));
+  return snap.docs.map(d => ({ id: d.id, ...d.data() } as ConveyanceRecord));
 }
 
 // ── Dashboard Stats ───────────────────────────────────────────────────────

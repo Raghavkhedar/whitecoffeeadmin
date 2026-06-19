@@ -8,6 +8,9 @@ export interface User {
   employeeId: string;
   salaryRate?: number;
   plBalance?: number;
+  homeLat?: number;
+  homeLng?: number;
+  conveyanceRateType?: 1 | 2;
   createdAt?: Timestamp;
 }
 
@@ -111,4 +114,18 @@ export interface SentNotification {
   recipientCount: number;
   sentByName: string;
   sentAt?: Timestamp;
+}
+
+export interface ConveyanceRecord {
+  id: string;
+  userId: string;
+  userName: string;
+  employeeId: string;
+  date: string;
+  month: string;
+  route: string;
+  totalKm: number;
+  ratePerKm: number;
+  conveyance: number;
+  computedAt?: Timestamp;
 }

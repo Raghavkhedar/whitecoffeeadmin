@@ -13,10 +13,10 @@ const SHEETS_KEY   = defineSecret("ATTENDANCE_SHEETS_KEY");
 const MAPS_KEY     = defineSecret("MAPS_API_KEY");
 const SHEET_ID     = "1pemb9uSbu-NenE_QSkfPx6842EG1T6Z21isGM5IXrYs";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CONVEYANCE RATE — change this number to update the rate for all employees
-const CONVEYANCE_RATE_PER_KM = 2.5; // ₹ per km
-// ─────────────────────────────────────────────────────────────────────────────
+// Conveyance rates are now stored in Firestore (config/conveyance) and
+// assigned per employee (user.conveyanceRateType = 1 or 2).
+// Fallback if config is missing:
+const CONVEYANCE_RATE_FALLBACK = 2.5;
 
 const TABS = {
   EMPLOYEE_DASHBOARD: "Employee Dashboard",
@@ -371,6 +371,12 @@ exports.exportToSheets = onSchedule(
     let conveyanceByUserId = new Map(); // userId → total ₹ conveyance this month
     {
       const mapsKey    = MAPS_KEY.value();
+
+      // Read per-employee conveyance rate config from Firestore
+      const convConfigSnap = await db.doc("config/conveyance").get();
+      const convConfig     = convConfigSnap.exists ? convConfigSnap.data() : {};
+      const rateValues     = { 1: convConfig.rate1 || CONVEYANCE_RATE_FALLBACK, 2: convConfig.rate2 || CONVEYANCE_RATE_FALLBACK };
+
       const opsUsersSnap = await db.collection("users").where("role", "==", "operations").get();
       const opsUsers   = new Map(opsUsersSnap.docs.map((d) => [d.id, d.data()]));
 
@@ -401,6 +407,13 @@ exports.exportToSheets = onSchedule(
         return parts.join(" → ");
       }
 
+      function resolveCoords(event, user) {
+        if ((event.type === "home_in" || event.type === "home_out") && user.homeLat && user.homeLng) {
+          return { lat: user.homeLat, lng: user.homeLng };
+        }
+        return { lat: event.latitude, lng: event.longitude };
+      }
+
       const entries = [...grouped.entries()];
       const BATCH   = 20;
       const allRows = [];
@@ -410,21 +423,51 @@ exports.exportToSheets = onSchedule(
         const results = await Promise.all(batch.map(async ([key, events]) => {
           const userId = key.split("__")[0];
           const user   = opsUsers.get(userId) || {};
+          const ratePerKm = rateValues[user.conveyanceRateType] || CONVEYANCE_RATE_FALLBACK;
           let totalKm  = 0;
           for (let j = 0; j < events.length - 1; j++) {
-            const a = events[j], b = events[j + 1];
-            totalKm += await getRoadKm(a.latitude, a.longitude, b.latitude, b.longitude, mapsKey);
+            const a = resolveCoords(events[j], user);
+            const b = resolveCoords(events[j + 1], user);
+            totalKm += await getRoadKm(a.lat, a.lng, b.lat, b.lng, mapsKey);
           }
-          const conveyance = totalKm * CONVEYANCE_RATE_PER_KM;
+          const conveyance = totalKm * ratePerKm;
           conveyanceByUserId.set(userId, (conveyanceByUserId.get(userId) || 0) + conveyance);
-          return [events[0].date, user.name || user.userName || "", user.employeeId || "", buildRoute(events), totalKm.toFixed(2), conveyance.toFixed(2)];
+          return [events[0].date, user.name || user.userName || "", user.employeeId || "", buildRoute(events), totalKm.toFixed(2), conveyance.toFixed(2), `₹${ratePerKm}/km`, userId, ratePerKm];
         }));
         allRows.push(...results);
       }
 
       allRows.sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
-      const header = ["Date", "Employee Name", "Employee ID", "Route", "Total KM", `Conveyance (₹ @ ₹${CONVEYANCE_RATE_PER_KM}/km)`];
-      await writeTab(sheets, TABS.CONVEYANCE, [header, ...allRows]);
+
+      // Persist daily conveyance records to Firestore
+      {
+        const BATCH_LIMIT = 500;
+        let fbBatch = db.batch();
+        let opCount = 0;
+        const monthStr = monthStart.slice(0, 7);
+
+        for (const row of allRows) {
+          const [date, userName, employeeId, route, totalKmStr, conveyanceStr, , odUserId, ratePerKm] = row;
+          const docRef = db.collection("conveyance").doc(`${odUserId}__${date}`);
+          fbBatch.set(docRef, {
+            userId: odUserId, userName, employeeId, date, month: monthStr,
+            route, totalKm: parseFloat(totalKmStr), ratePerKm,
+            conveyance: parseFloat(conveyanceStr),
+            computedAt: admin.firestore.Timestamp.now(),
+          });
+          opCount++;
+          if (opCount >= BATCH_LIMIT) {
+            await fbBatch.commit();
+            fbBatch = db.batch();
+            opCount = 0;
+          }
+        }
+        if (opCount > 0) await fbBatch.commit();
+        console.log(`Conveyance: ${allRows.length} records persisted to Firestore`);
+      }
+
+      const header = ["Date", "Employee Name", "Employee ID", "Route", "Total KM", "Conveyance (₹)", "Rate"];
+      await writeTab(sheets, TABS.CONVEYANCE, [header, ...allRows.map(r => r.slice(0, 7))]);
       console.log(`Conveyance: ${allRows.length} rows`);
     }
 

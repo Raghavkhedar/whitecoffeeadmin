@@ -14,8 +14,22 @@ function RoleBadge({ role }: { role: string }) {
   return <span className={cls}>{role}</span>;
 }
 
-const EMPTY_FORM: { name: string; email: string; password: string; employeeId: string; role: Role; salaryRate: string } =
-  { name: '', email: '', password: '', employeeId: '', role: 'operations', salaryRate: '' };
+interface FormState {
+  name: string;
+  email: string;
+  password: string;
+  employeeId: string;
+  role: Role;
+  salaryRate: string;
+  homeLat: string;
+  homeLng: string;
+  conveyanceRateType: '' | '1' | '2';
+}
+
+const EMPTY_FORM: FormState = {
+  name: '', email: '', password: '', employeeId: '', role: 'operations',
+  salaryRate: '', homeLat: '', homeLng: '', conveyanceRateType: '',
+};
 
 export default function UsersPage() {
   const [users, setUsers]       = useState<User[]>([]);
@@ -23,7 +37,7 @@ export default function UsersPage() {
   const [error, setError]       = useState('');
   const [showModal, setShowModal] = useState(false);
   const [editing, setEditing]   = useState<User | null>(null);
-  const [form, setForm]         = useState({ ...EMPTY_FORM });
+  const [form, setForm]         = useState<FormState>({ ...EMPTY_FORM });
   const [saving, setSaving]     = useState(false);
   const [formError, setFormError] = useState('');
 
@@ -50,7 +64,17 @@ export default function UsersPage() {
 
   function openEdit(u: User) {
     setEditing(u);
-    setForm({ name: u.name ?? '', email: u.email ?? '', password: '', employeeId: u.employeeId ?? '', role: (u.role as Role) ?? 'operations', salaryRate: u.salaryRate ? String(u.salaryRate) : '' });
+    setForm({
+      name: u.name ?? '',
+      email: u.email ?? '',
+      password: '',
+      employeeId: u.employeeId ?? '',
+      role: (u.role as Role) ?? 'operations',
+      salaryRate: u.salaryRate ? String(u.salaryRate) : '',
+      homeLat: u.homeLat ? String(u.homeLat) : '',
+      homeLng: u.homeLng ? String(u.homeLng) : '',
+      conveyanceRateType: u.conveyanceRateType ? String(u.conveyanceRateType) as '1' | '2' : '',
+    });
     setFormError('');
     setShowModal(true);
   }
@@ -63,8 +87,15 @@ export default function UsersPage() {
     setSaving(true);
     try {
       const salaryRate = form.salaryRate ? parseFloat(form.salaryRate) : 0;
+      const homeLat = form.homeLat ? parseFloat(form.homeLat) : undefined;
+      const homeLng = form.homeLng ? parseFloat(form.homeLng) : undefined;
+      const conveyanceRateType = form.conveyanceRateType ? (parseInt(form.conveyanceRateType) as 1 | 2) : undefined;
+
       if (editing) {
-        await updateUserProfile(editing.id, { name: form.name.trim(), role: form.role, employeeId: form.employeeId.trim(), salaryRate });
+        await updateUserProfile(editing.id, {
+          name: form.name.trim(), role: form.role, employeeId: form.employeeId.trim(),
+          salaryRate, homeLat, homeLng, conveyanceRateType,
+        });
       } else {
         const secondary = initializeApp(firebaseConfig, `create_${Date.now()}`);
         const secAuth   = getAuth(secondary);
@@ -79,6 +110,7 @@ export default function UsersPage() {
         await createUserProfile(uid, {
           name: form.name.trim(), email: form.email.trim().toLowerCase(),
           role: form.role, employeeId: form.employeeId.trim(), salaryRate,
+          homeLat, homeLng, conveyanceRateType,
         });
       }
       setShowModal(false);
@@ -137,29 +169,33 @@ export default function UsersPage() {
         ) : users.length === 0 ? (
           <div className="p-8 text-center text-text-secondary">No employees yet.</div>
         ) : (
-          <table className="w-full text-sm">
-            <thead className="bg-background border-b border-border">
-              <tr>
-                {['Name', 'Email', 'Employee ID', 'Role', 'Salary Rate', ''].map(h => (
-                  <th key={h} className="px-4 py-3 text-left text-xs font-bold text-text-secondary uppercase tracking-wide">{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border">
-              {users.map(u => (
-                <tr key={u.id} className="hover:bg-background transition-colors">
-                  <td className="px-4 py-3 font-medium text-text-primary">{u.name}</td>
-                  <td className="px-4 py-3 text-text-secondary">{u.email}</td>
-                  <td className="px-4 py-3 text-text-secondary">{u.employeeId || '—'}</td>
-                  <td className="px-4 py-3"><RoleBadge role={u.role} /></td>
-                  <td className="px-4 py-3 text-text-secondary">{u.salaryRate ? `₹${u.salaryRate}` : '—'}</td>
-                  <td className="px-4 py-3">
-                    <button className="text-primary text-xs font-medium hover:underline" onClick={() => openEdit(u)}>Edit</button>
-                  </td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-background border-b border-border">
+                <tr>
+                  {['Name', 'Email', 'Employee ID', 'Role', 'Salary Rate', 'Conveyance Rate', 'Home Location', ''].map(h => (
+                    <th key={h} className="px-4 py-3 text-left text-xs font-bold text-text-secondary uppercase tracking-wide">{h}</th>
+                  ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {users.map(u => (
+                  <tr key={u.id} className="hover:bg-background transition-colors">
+                    <td className="px-4 py-3 font-medium text-text-primary">{u.name}</td>
+                    <td className="px-4 py-3 text-text-secondary">{u.email}</td>
+                    <td className="px-4 py-3 text-text-secondary">{u.employeeId || '—'}</td>
+                    <td className="px-4 py-3"><RoleBadge role={u.role} /></td>
+                    <td className="px-4 py-3 text-text-secondary">{u.salaryRate ? `₹${u.salaryRate}` : '—'}</td>
+                    <td className="px-4 py-3 text-text-secondary">{u.conveyanceRateType ? `Conveyance ${u.conveyanceRateType}` : '—'}</td>
+                    <td className="px-4 py-3 text-text-secondary text-xs">{u.homeLat && u.homeLng ? `${u.homeLat}, ${u.homeLng}` : '—'}</td>
+                    <td className="px-4 py-3">
+                      <button className="text-primary text-xs font-medium hover:underline" onClick={() => openEdit(u)}>Edit</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
 
@@ -185,6 +221,20 @@ export default function UsersPage() {
               </div>
 
               <div><label className="label">Salary Rate (₹/day)</label><input className="input" type="number" step="any" min="0" value={form.salaryRate} onChange={e => setForm(f => ({ ...f, salaryRate: e.target.value }))} placeholder="e.g. 800" /></div>
+
+              <div>
+                <label className="label">Conveyance Rate</label>
+                <select className="input" value={form.conveyanceRateType} onChange={e => setForm(f => ({ ...f, conveyanceRateType: e.target.value as '' | '1' | '2' }))}>
+                  <option value="">None</option>
+                  <option value="1">Conveyance 1</option>
+                  <option value="2">Conveyance 2</option>
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="label">Home Latitude</label><input className="input" type="number" step="any" value={form.homeLat} onChange={e => setForm(f => ({ ...f, homeLat: e.target.value }))} placeholder="e.g. 28.6257" /></div>
+                <div><label className="label">Home Longitude</label><input className="input" type="number" step="any" value={form.homeLng} onChange={e => setForm(f => ({ ...f, homeLng: e.target.value }))} placeholder="e.g. 77.3760" /></div>
+              </div>
 
               {formError && <p className="text-red-500 text-sm">{formError}</p>}
 

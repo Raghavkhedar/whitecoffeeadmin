@@ -7,5 +7,6 @@ functions/node_modules/
 .firebase/
 .agents/
 functions/.env
+functions/conveyance-calc.js
 skills-lock.json
 tsconfig.tsbuildinfo
