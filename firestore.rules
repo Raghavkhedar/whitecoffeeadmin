@@ -1,0 +1,244 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ──────────────────────────────────────────────────
+
+    function isLoggedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    function userRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isAdmin() {
+      return userRole() == 'admin';
+    }
+
+    // Returns true if the write touches ONLY the given fields (and no others).
+    function changedKeysWithin(allowed) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(allowed);
+    }
+
+    // True if a create payload does NOT assert an approved/rejected status.
+    // Submission docs (material_*, tool_transfers, work_progress) omit `status`
+    // entirely on create; an owner may only ever create work that is unreviewed.
+    // Without this, an owner could self-approve by writing status:"approved" at
+    // create time (the update rules already block flipping status post-create).
+    function createdUnreviewed() {
+      return !('status' in request.resource.data)
+             || request.resource.data.status == 'pending';
+    }
+
+    // ── /users/{userId} — User profiles ──────────────────────────────────
+
+    match /users/{userId} {
+      // Users read/write their own profile; admin reads/writes all
+      allow read:   if isLoggedIn() && (isOwner(userId) || isAdmin());
+      // Only admin can create users (via secondary Firebase app in UserRepository)
+      allow create: if isLoggedIn() && isAdmin();
+      // Admin can update any field. A user may update ONLY their own session/FCM
+      // token fields — never role/salaryRate/etc. (prevents self-promotion to admin).
+      allow update: if isLoggedIn() && (
+        isAdmin() ||
+        (isOwner(userId) && changedKeysWithin(['activeSessionToken', 'fcmToken']))
+      );
+      allow delete: if isLoggedIn() && isAdmin();
+
+      // ── /attendance/{docId} ───────────────────────────────────────────
+      match /attendance/{docId} {
+        allow read:   if isLoggedIn() && (isOwner(userId) || isAdmin());
+        allow create: if isLoggedIn() && isOwner(userId);
+        // Events are immutable once recorded EXCEPT the admin-filled Site ID:
+        // ops type a free-text site name at check-in and an admin later patches
+        // the `siteId` field from the Site IDs page (updateAttendanceSiteId).
+        // Restricting to siteId keeps the check-in event itself tamper-proof.
+        allow update: if isLoggedIn() && isAdmin() && changedKeysWithin(['siteId']);
+        allow delete: if false;
+      }
+
+      // ── /material_requests/{docId} ────────────────────────────────────
+      match /material_requests/{docId} {
+        allow read:   if isLoggedIn() && (isOwner(userId) || isAdmin());
+        allow create: if isLoggedIn() && isOwner(userId) && createdUnreviewed();
+        // Owner may ONLY patch photoUrls (post-upload); admin can update status etc.
+        // Without this restriction an owner could flip their own status to "approved".
+        allow update: if isLoggedIn() && (
+          isAdmin() ||
+          (isOwner(userId) && changedKeysWithin(['photoUrls']))
+        );
+        allow delete: if false;
+      }
+
+      // ── /material_purchases/{docId} ───────────────────────────────────
+      match /material_purchases/{docId} {
+        allow read:   if isLoggedIn() && (isOwner(userId) || isAdmin());
+        allow create: if isLoggedIn() && isOwner(userId) && createdUnreviewed();
+        allow update: if isLoggedIn() && (
+          isAdmin() ||
+          (isOwner(userId) && changedKeysWithin(['photoUrls']))
+        );
+        allow delete: if false;
+      }
+
+      // ── /material_transfers/{docId} ───────────────────────────────────
+      match /material_transfers/{docId} {
+        allow read:   if isLoggedIn() && (isOwner(userId) || isAdmin());
+        allow create: if isLoggedIn() && isOwner(userId) && createdUnreviewed();
+        allow update: if isLoggedIn() && (
+          isAdmin() ||
+          (isOwner(userId) && changedKeysWithin(['photoUrls']))
+        );
+        allow delete: if false;
+      }
+
+      // ── /tool_transfers/{docId} ───────────────────────────────────────
+      match /tool_transfers/{docId} {
+        allow read:   if isLoggedIn() && (isOwner(userId) || isAdmin());
+        allow create: if isLoggedIn() && isOwner(userId) && createdUnreviewed();
+        allow update: if isLoggedIn() && (
+          isAdmin() ||
+          (isOwner(userId) && changedKeysWithin(['photoUrls']))
+        );
+        allow delete: if false;
+      }
+
+      // ── /work_progress/{docId} ────────────────────────────────────────
+      match /work_progress/{docId} {
+        allow read:   if isLoggedIn() && (isOwner(userId) || isAdmin());
+        allow create: if isLoggedIn() && isOwner(userId) && createdUnreviewed();
+        allow update: if isLoggedIn() && (
+          isAdmin() ||
+          (isOwner(userId) && changedKeysWithin(['photoUrls']))
+        );
+        allow delete: if false;
+      }
+
+      // ── /leave_requests/{docId} ───────────────────────────────────────
+      match /leave_requests/{docId} {
+        allow read:   if isLoggedIn() && (isOwner(userId) || isAdmin());
+        // Must be created pending — a self-approved leave would otherwise be
+        // counted as PL by the nightly computeDailyAttendanceStatus function.
+        allow create: if isLoggedIn() && isOwner(userId)
+                      && request.resource.data.status == 'pending';
+        // Admin updates status (approved/rejected); user cannot change status
+        allow update: if isLoggedIn() && isAdmin();
+        allow delete: if false;
+      }
+
+      // ── /notifications/{docId} ────────────────────────────────────────
+      match /notifications/{docId} {
+        allow read:   if isLoggedIn() && isOwner(userId);
+        // User's FcmService + admin portal sender can create
+        allow create: if isLoggedIn() && (isOwner(userId) || isAdmin());
+        // User marks as read; admin can also update
+        allow update: if isLoggedIn() && (isOwner(userId) || isAdmin());
+        allow delete: if false;
+      }
+
+      // ── /attendance_status/{date} ─────────────────────────────────────
+      // Written by Cloud Function (Admin SDK) for office/admin users (auto),
+      // and by admin portal for operations users (manual).
+      match /attendance_status/{date} {
+        allow read:  if isLoggedIn() && (isOwner(userId) || isAdmin());
+        allow write: if isLoggedIn() && isAdmin();
+      }
+
+      // ── /planned_hours/{date} ─────────────────────────────────────────
+      // Admin-set per-day shift window for operations employees. Read by the
+      // employee (their app) and the admin; only an admin may set it.
+      match /planned_hours/{date} {
+        allow read:  if isLoggedIn() && (isOwner(userId) || isAdmin());
+        allow write: if isLoggedIn() && isAdmin();
+      }
+
+      // ── /regularization_requests/{docId} ──────────────────────────────
+      match /regularization_requests/{docId} {
+        allow read:   if isLoggedIn() && (isOwner(userId) || isAdmin());
+        // Must be created pending — only an admin approval may flip the linked
+        // attendance_status to Present (done via writeBatch in the admin portal).
+        allow create: if isLoggedIn() && isOwner(userId)
+                      && request.resource.data.status == 'pending';
+        allow update: if isLoggedIn() && isAdmin();
+        allow delete: if false;
+      }
+    }
+
+    // ── collectionGroup — leave_requests (admin Leave Approvals screen) ──
+    // Required for LeaveApprovalsViewModel which does collectionGroup("leave_requests")
+    match /{path=**}/leave_requests/{docId} {
+      allow read:   if isLoggedIn() && isAdmin();
+      allow update: if isLoggedIn() && isAdmin();
+    }
+
+    // ── collectionGroup — admin portal Attendance & Submissions screens ──
+    // A per-subcollection match (e.g. /users/{userId}/attendance/{docId}) does NOT
+    // cover collectionGroup() queries that scan across all users — each collection
+    // needs its own top-level {path=**} rule for the admin portal's cross-user reads.
+    match /{path=**}/attendance/{docId} {
+      allow read: if isLoggedIn() && isAdmin();
+    }
+    match /{path=**}/material_requests/{docId} {
+      allow read: if isLoggedIn() && isAdmin();
+    }
+    match /{path=**}/material_purchases/{docId} {
+      allow read: if isLoggedIn() && isAdmin();
+    }
+    match /{path=**}/material_transfers/{docId} {
+      allow read: if isLoggedIn() && isAdmin();
+    }
+    match /{path=**}/tool_transfers/{docId} {
+      allow read: if isLoggedIn() && isAdmin();
+    }
+    match /{path=**}/work_progress/{docId} {
+      allow read: if isLoggedIn() && isAdmin();
+    }
+    match /{path=**}/attendance_status/{date} {
+      allow read:  if isLoggedIn() && isAdmin();
+      allow write: if isLoggedIn() && isAdmin();
+    }
+    // Required for getPlannedHoursForMonth() which does collectionGroup("planned_hours").
+    // The specific /users/{userId}/planned_hours/{date} match above authorizes the
+    // admin's per-doc write, but a collectionGroup READ needs this {path=**} rule.
+    match /{path=**}/planned_hours/{date} {
+      allow read: if isLoggedIn() && isAdmin();
+    }
+    match /{path=**}/regularization_requests/{docId} {
+      allow read, update: if isLoggedIn() && isAdmin();
+    }
+
+    // ── /sent_notifications/{docId} — Notification send log ─────────────
+    match /sent_notifications/{docId} {
+      allow read, write: if isLoggedIn() && isAdmin();
+    }
+
+    // ── /submission_edits/{docId} — Audit log for admin edits ────────────
+    match /submission_edits/{docId} {
+      allow read, write: if isLoggedIn() && isAdmin();
+    }
+
+    // ── /sites/{siteId} — Site management ────────────────────────────────
+    match /sites/{siteId} {
+      allow read:             if isLoggedIn();
+      allow create, update:   if isLoggedIn() && isAdmin();
+      allow delete:           if isLoggedIn() && isAdmin();
+    }
+
+    // ── /config/{docId} — App configuration (conveyance rates, etc.) ────
+    match /config/{docId} {
+      allow read:  if isLoggedIn() && isAdmin();
+      allow write: if isLoggedIn() && isAdmin();
+    }
+
+    // ── /conveyance/{docId} — Monthly conveyance records ────────────────
+    match /conveyance/{docId} {
+      allow read:  if isLoggedIn() && isAdmin();
+      allow write: if isLoggedIn() && isAdmin();
+    }
+  }
+}
