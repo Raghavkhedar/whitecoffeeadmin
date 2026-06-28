@@ -20,7 +20,7 @@ No test framework configured.
 
 **Auth guard**: `src/app/(admin)/layout.tsx` listens to `onAuthStateChanged`, redirects to `/login`, and verifies `role === 'admin'` in Firestore.
 
-**Routing**: `(admin)` is a route group (no URL segment) — `/dashboard`, `/users`, `/sites`, `/leaves`, `/attendance`, `/submissions` are all protected.
+**Routing**: `(admin)` is a route group (no URL segment) — `/dashboard`, `/employee-dashboard`, `/users`, `/sites`, `/leaves`, `/attendance`, `/submissions` are all protected.
 
 ## Firestore Collections
 
@@ -37,7 +37,8 @@ Required composite indexes (Firebase Console):
 - `leave_requests`: `status` ASC + `submittedAt` ASC
 - `attendance`: `date` ASC + `timestamp` ASC
 - `material_requests`: `submittedAt` DESC
-- collection-group `planned_hours`: `date` ASC (for `getPlannedHoursForMonth`)
+- collection-group `planned_hours`: `date` ASC (for `getPlannedHoursForMonth`, `getPlannedHoursForDateRange`)
+- collection-group `attendance`: `date` ASC + `timestamp` ASC (for `getAttendanceForDateRange`)
 
 ## Attendance Status Logic
 
@@ -71,7 +72,19 @@ PL balance: +1 on 1st of month (`accrueMonthlyLeave`), -1 per PL day used.
 
 - **Always resolve Name/ID from the live `users` collection** — not the snapshot values on each doc. Use `uidOf(doc)` + `userNameMap`/`userEmpIdMap` (keyed by uid). `uidOf` reads `userId` field, falling back to parent path for subcollection docs.
 - **Attendance tab** is per-employee/day (not per-event): In Time / In Location / Site ID / Out Time / Out Location / All Activity. Built from union of attendance events and status docs — Absent/PL/UPL/SLNF days appear even without check-in events. **All Activity** = full chronological log with resolved Site ID in brackets.
-- **Employee Dashboard tab** breaks Days NP into per-status columns (Present / SL / Half Day / SLNF / PL / UPL / Absent) before the total. **Imprest** is preserved across runs by locating columns by header name (not fixed index).
+- **Employee Dashboard tab** — MTD summary, one row per employee: Date | EMP Name | EMP ID | Days Passed | Present | SL | Half Day | SLNF | PL | UPL | Absent | Leaves | Days NP | Salary Rate | Salary Due MTD | Covy Due | Imprest Due | TOTAL DUE. Includes CF BAL (carry-forward leave) and TOTAL summary rows. **Imprest** is preserved across runs by locating columns by header name (not fixed index). Conveyance is built from the `conveyance` collection (operations only).
+
+## Employee Dashboard Page
+
+`/employee-dashboard` (`src/app/(admin)/employee-dashboard/page.tsx`) — real-time view of expected vs actual working hours across a configurable date range.
+
+- **Filters**: date preset (Today / Last 7/15/30/90/180/365 days / custom), role, individual employee
+- **Columns**: Name, Emp ID, Role, PL Bal, WO Bal, Working Hrs (expected), Actual Hrs, Shortage
+- **Single-day view**: also shows Check-in / Check-out times
+- **Expected hours**: office/admin = 8 h × working days (Mon–Sat); ops = sum of admin-set `planned_hours` windows
+- **Actual hours**: derived from `office_in`/`office_out` (office) or `site_in`/`site_out` (ops) attendance events
+- **Data**: `getAttendanceForDateRange(start, end)` + `getPlannedHoursForDateRange(start, end)` — both use `collectionGroup` queries
+- Sundays excluded from working day count; sort order: office → admin → ops, then alphabetical
 
 ## Styling
 
