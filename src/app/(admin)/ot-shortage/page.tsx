@@ -9,6 +9,7 @@ import { RoleBadge } from '@/components/ui';
 import ExportButton from '@/components/ExportButton';
 import { downloadSheet } from '@/lib/excel';
 import { istTodayStr, istDaysAgoStr } from '@/lib/date';
+import { computeDayLedger, netLedgerMins, WO_DEBIT_MINS } from '@/lib/otLedger';
 
 // ── Date range helpers ────────────────────────────────────────────────────────
 
@@ -102,7 +103,6 @@ function fmtHHMM(hhmm?: string): string {
 }
 
 const OFFICE_DAY_MINS = 8 * 60;
-const WO_DEBIT_MINS = 8 * 60; // a WO (paid no-work day off) owes a standard 8h, payable by OT
 
 // Field-work event types for operations (home events excluded — commute bookends)
 const OPS_IN_TYPES  = new Set(['site_in', 'market_in']);
@@ -234,30 +234,21 @@ function aggregateForEmployee(
       firstInSecs: firstIn, lastOutSecs: lastOut,
     };
 
-    if (isOps && restDay) {
-      // Sunday / holiday: every worked minute counts as OT — but ONLY when the admin has
-      // authorized it (prevents self-granting by showing up). Authorization = auto-approval.
-      if (otAuthByDate.has(date)) {
-        detail.restDayOtMins = dayMins;
-        restDayOtRangeMins += dayMins;
-        restDayOtDays.push(detail);
-      } else {
-        unauthorizedRestDays.push(detail);
-      }
-    } else if (isOps && plannedDay > 0) {
-      // Normal working day with a shift. Declared OT is a pre-approval ceiling, NOT an obligation:
-      // shortage is measured vs the plain shift; OT up to declared is auto-approved, beyond needs review.
-      const surplus = Math.max(0, dayMins - plannedDay);
-      detail.shortageMins     = Math.max(0, plannedDay - dayMins);
-      detail.autoOtMins       = Math.min(surplus, declaredDay);
-      detail.pendingExtraMins = Math.max(0, surplus - declaredDay);
+    if (isOps) {
+      const led = computeDayLedger({
+        plannedMins: plannedDay, declaredOtMins: declaredDay, actualMins: dayMins,
+        isRestDay: restDay, otAuthorized: otAuthByDate.has(date),
+      });
+      detail.shortageMins     = led.shortageMins;
+      detail.autoOtMins       = led.autoOtMins;
+      detail.pendingExtraMins = led.pendingExtraMins;
+      detail.restDayOtMins    = led.restDayOtMins;
 
-      if (detail.shortageMins > 0) {
-        shortageRangeMins += detail.shortageMins;
-        shortageDays.push(detail);
-      }
-      if (detail.autoOtMins > 0) autoOtRangeMins += detail.autoOtMins;
-      if (detail.pendingExtraMins > 0) otDays.push(detail);
+      if (led.shortageMins > 0)     { shortageRangeMins += led.shortageMins; shortageDays.push(detail); }
+      if (led.autoOtMins > 0)       autoOtRangeMins += led.autoOtMins;
+      if (led.pendingExtraMins > 0) otDays.push(detail);
+      if (led.restDayOtMins > 0)    { restDayOtRangeMins += led.restDayOtMins; restDayOtDays.push(detail); }
+      if (led.unauthorizedRestDay)  unauthorizedRestDays.push(detail);
     }
     workedDays.push(detail);
   });
@@ -276,10 +267,10 @@ function aggregateForEmployee(
     : [];
   const woDebitMins = woDates.length * WO_DEBIT_MINS;
 
-  // Net ledger for the range: approved OT (auto + granted + rest-day) minus shortage minus WO debit.
-  // Pending OT is excluded (not credited until approved). Informational only — no payroll effect yet.
-  const netLedgerMins = isOps
-    ? (autoOtRangeMins + approvedOtRangeMins + restDayOtRangeMins) - shortageRangeMins - woDebitMins
+  // Net ledger for the range. Pending OT is excluded (not credited until approved).
+  // Informational only — no payroll effect yet.
+  const rangeNetMins = isOps
+    ? netLedgerMins({ autoOtMins: autoOtRangeMins, restDayOtMins: restDayOtRangeMins, approvedGrantedMins: approvedOtRangeMins, shortageMins: shortageRangeMins, woDebitMins })
     : 0;
 
   return {
@@ -302,7 +293,7 @@ function aggregateForEmployee(
     unauthorizedRestDays: unauthorizedRestDays.sort((a, b) => a.date.localeCompare(b.date)),
     woDates,
     woDebitMins,
-    netLedgerMins,
+    netLedgerMins: rangeNetMins,
   };
 }
 

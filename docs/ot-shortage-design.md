@@ -172,6 +172,18 @@ flow**, which is *not yet built* — it should land before (or with) shortage go
 > Still **portal-only / no payroll effect** so far — the nightly Cloud Function and salary math
 > are untouched. The ledger/settlement wiring (steps 4–7) is where pay is affected.
 
+### Shared ledger module + tests (2026-06-30)
+The per-day math (shortage / declared-OT split / rest-day OT) and the net formula now live in one
+pure module **`src/lib/otLedger.ts`** (`computeDayLedger`, `netLedgerMins`, `WO_DEBIT_MINS`), used by
+**both** the OT/Shortage page and the Employee Dashboard — no more duplicated logic to drift.
+Covered by **`src/lib/otLedger.test.ts`** (run: `npx tsx src/lib/otLedger.test.ts`; 15 cases, all
+green) — declared-OT partial fulfilment, beyond-declared→pending, rest-day authorized/unauthorized,
+WO debit, and the net/offset cases. Note: the Employee Dashboard now shows **office/admin shortage
+only** (no OT) to match the operations-only OT scope; ops use the full ledger.
+
+> Live end-to-end testing in the running app is blocked (admin auth + would mutate production
+> Firestore), so correctness is verified via these unit tests + `tsc` + `next build`.
+
 ## Relevant code (current)
 
 - Nightly engine: `functions/index.js:287-308` (shortage/OT per day → `daily_hours`, lifetime increment)

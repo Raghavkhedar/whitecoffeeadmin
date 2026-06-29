@@ -9,6 +9,7 @@ import { RoleBadge } from '@/components/ui';
 import ExportButton from '@/components/ExportButton';
 import { downloadSheet } from '@/lib/excel';
 import { istTodayStr, istDaysAgoStr } from '@/lib/date';
+import { computeDayLedger } from '@/lib/otLedger';
 
 // ── Date range helpers ────────────────────────────────────────────────────────
 
@@ -194,17 +195,21 @@ function aggregateForEmployee(
     const planInfo    = isOps ? plannedByDate.get(date) : { planned: OFFICE_DAY_MINS, declared: 0 };
     const plannedDay  = planInfo?.planned ?? 0;
     const declaredDay = planInfo?.declared ?? 0;
-    if (isOps && restDay) {
-      if (otAuthByDate.has(date)) restDayOtRangeMins += dayMins;
-    } else if (plannedDay > 0) {
-      const surplus          = Math.max(0, dayMins - plannedDay);
-      const autoOt           = Math.min(surplus, declaredDay);
-      const pendingExtra      = Math.max(0, surplus - declaredDay);
-      shortageMins += Math.max(0, plannedDay - dayMins);
-      autoOtRangeMins += autoOt;
-      if (pendingExtra > 0) {
-        otDays.push({ date, plannedMins: plannedDay, declaredOtMins: declaredDay, actualMins: dayMins, autoOtMins: autoOt, pendingExtraMins: pendingExtra });
+    // Office/admin never accrue OT/shortage here (scope: ops only).
+    if (isOps) {
+      const led = computeDayLedger({
+        plannedMins: plannedDay, declaredOtMins: declaredDay, actualMins: dayMins,
+        isRestDay: restDay, otAuthorized: otAuthByDate.has(date),
+      });
+      shortageMins    += led.shortageMins;
+      autoOtRangeMins += led.autoOtMins;
+      restDayOtRangeMins += led.restDayOtMins;
+      if (led.pendingExtraMins > 0) {
+        otDays.push({ date, plannedMins: plannedDay, declaredOtMins: declaredDay, actualMins: dayMins, autoOtMins: led.autoOtMins, pendingExtraMins: led.pendingExtraMins });
       }
+    } else if (plannedDay > 0 && !restDay) {
+      // Office/admin: shortage only, vs the fixed 8h window (no OT, no rest-day, no holidays).
+      shortageMins += Math.max(0, plannedDay - dayMins);
     }
   });
 
