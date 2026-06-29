@@ -1,8 +1,8 @@
 # OT, Shortage & WO — System Redesign (WORKING DRAFT)
 
-> **Status:** design in progress. Captures the discussion before any code is written.
-> Resume point is at the bottom (**"Open questions — answer to continue"**).
-> Today's date when drafted: 2026-06-29.
+> **Status:** model fully decided (all 5 questions answered). Ready to finalize the
+> implementation plan. No code written yet.
+> Today's date when drafted: 2026-06-29. Decisions locked: 2026-06-29.
 
 ## Why we're redesigning
 
@@ -26,8 +26,8 @@ Everything is **minutes**, held in a **per-employee, per-month signed balance** 
 | Worked > planned, **pre-declared** by admin (`declaredOtMins`) | + OT (auto-approved, capped at declared) |
 | Worked > planned, **beyond** declared | new **pending** OT request → counts only once admin approves |
 | **Sunday/holiday** work (authorized) | + all worked minutes as OT |
-| **WO** given (no-work weekday) | − 480 debit, payable by OT across the month |
-| **Month end** | net > 0 → pay cash · net < 0 → deduct from salary |
+| **WO** given (no-work weekday) | **paid day (+1 in `daysNP`)** AND **−480 ledger debit** (clawed back if not worked off) |
+| **Month end** | net > 0 → pay cash · net < 0 → deduct from salary, **both at `minutes/480 × salaryRate`** |
 
 Additional confirmed points:
 - **Shortage only applies after admin regularizes a day to Present** (via the
@@ -64,20 +64,40 @@ Worked example — planned 10:00–18:00 (480), declared +30 → expected 510:
 - out 18:15 (495): OT +15, shortage 15 ✓ ("15 min shortage left")
 - out 19:00 (540): OT +30 auto, **+30 new pending request** ✓
 
-## Open questions — answer to continue (RESUME POINT)
+## Decisions (LOCKED 2026-06-29)
 
-1. **WO semantics (fairness landmine — decide first).** A WO is given *because the company had
-   no work*. Two readings:
-   - **(a) Real debit:** unmade-up WO at month end is deducted from salary. (What the answers literally said.)
-   - **(b) Free-unless-used:** WO never deducts pay on its own; it only exists so that *if* he works
-     a rest day, that OT applies against the WO instead of being paid cash. Unused WO at month end disappears.
-   → **Which one?**
-2. **OT cash rate & premiums.** Net-positive minutes pay straight **1× (minutes/480 × salaryRate)**?
-   Or do **Sunday/holiday** OT pay a premium (e.g. 2×, the India legal norm)? If Sunday OT is 2× but
-   offsets shortage at 1×, netting gets ambiguous — need the rule.
-3. **Net-negative deduction rate.** Symmetric — shortage deducted at the same `minutes/480 × salaryRate`? (assumed yes, confirm)
-4. **Grace window.** Recommend a configurable **±10 min** grace where nothing accrues (kills 2-min-OT noise). Want it? threshold?
-5. **Scope.** Ops only (today's behavior), or extend the whole ledger to **office/admin** too?
+1. **WO semantics → paid day + debit.** A WO day is a **new paid status** counting **+1 in
+   `daysNP`** (so the employee is paid for it) AND carries a **−480 min obligation** in the
+   monthly ledger. Net effect: he keeps the WO day's pay only if he works it off via rest-day
+   OT (−480 + 480 = 0); if unworked, the −480 claws the pay back → that day ends up unpaid.
+   No double-docking. *(Today WO is non-functional — see "Key code finding" below.)*
+2. **OT pay rate → straight 1×.** Net-positive minutes pay `(net minutes / 480) × salaryRate`.
+   No Sunday/holiday premium. 1 OT min = 1 shortage min = same rupee value (clean 1:1 netting).
+3. **Shortage deduction → symmetric 1×.** Net-negative minutes deduct at the same
+   `(net minutes / 480) × salaryRate`.
+4. **Grace window → none.** Exact to the minute, no buffer.
+5. **Scope → operations only.** Office/admin stay fixed 8h with no ledger (unchanged).
+
+### Key code finding (WO is vestigial today)
+- There is **no "WO" attendance status** — statuses are only Present / SL / HalfDay / SLNF /
+  Absent / PL / LWP (`attendance/page.tsx:98-120`).
+- `users.woBalance` is a **manual number** shown on dashboards (`employee-dashboard/page.tsx:401`,
+  `users/page.tsx:170`); **no function writes it and it has zero salary effect** (`daysNP` ignores WO).
+- So a no-work day today is simply uncounted → **already effectively unpaid**. Implementing
+  decision 1 means **adding a real paid WO status + automation** from near-scratch.
+
+### Monthly payroll formula (the wiring)
+```
+payroll = (daysNP × salaryRate)                      # daysNP now INCLUDES WO as +1
+        + (netLedgerMins / 480 × salaryRate)         # netLedgerMins may be negative (deduction)
+
+netLedgerMins = Σ approvedOT(weekday, incl. auto-declared)
+              + Σ authorizedOT(Sunday/holiday, all worked mins)
+              − Σ shortage(Present days only)
+              − Σ 480 per WO day
+```
+All pending (un-approved) OT must be resolved by the admin **before** the month is locked,
+or it lapses (does not auto-credit).
 
 ## Robustness pieces to add regardless of the answers
 
@@ -91,13 +111,36 @@ Worked example — planned 10:00–18:00 (480), declared +30 → expected 510:
 - **Single source of truth:** make `daily_hours/{date}` canonical; the portal reads it for closed
   past days and only live-recomputes *today*.
 
-## Likely architecture changes (not yet decided/built)
+## Architecture changes (planned)
 
-- `daily_hours/{date}` becomes canonical (portal reads, doesn't recompute past days).
-- New `users/{uid}/ot_authorizations/{date}` (or a `declaredOtMins` field on `planned_hours`) for pre-declared OT.
-- New `users/{uid}/settlements/{YYYY-MM}` for the monthly lock/snapshot + payroll feed.
-- Payroll (`exportToSheets` / employee dashboard) must add the net OT pay / shortage deduction line.
-- Regularization flow (separate, to be built) is a dependency for the "shortage only on Present" rule.
+1. **`daily_hours/{date}` becomes canonical.** Portal reads it for closed past days; live-recompute
+   only for *today*. Removes the current dual-source drift.
+2. **Pre-declared OT** = a `declaredOtMins` field on `planned_hours/{date}` (set by admin). Drives the
+   core formula (auto-approve up to declared; flag beyond as pending).
+3. **New paid WO status.** Add `'WO'` to the attendance-status set, paid ×1 in `daysNP`; nightly engine
+   and the attendance page both recognize it. Marking a day WO writes a `−480` ledger debit for that month.
+4. **New `users/{uid}/settlements/{YYYY-MM}`** — monthly snapshot: every ledger line, the net minutes,
+   the cash/deduction amount, who settled, `locked` flag. Immutable after lock; reopen is audited.
+5. **Sunday/holiday authorization flag** — all-hours-OT only when admin authorized (a `planned_hours`
+   entry on that date, or an explicit flag), never on a bare punch.
+6. **Manual OT entry / adjustment** path for anomalies (missed-punch days etc.), `markedBy:'admin'`,
+   reason required, survives recompute.
+7. **Payroll wiring** — `exportToSheets` Employee Dashboard tab + the portal dashboard add the
+   `netLedgerMins/480 × salaryRate` line and count WO in `daysNP` (see formula above).
+8. **Replace lifetime counters** (`users.approvedOtMins`, `users.shortageMins`) with per-month
+   ledger aggregates (keep a lifetime sum only if wanted for history).
+
+**Dependency:** the "shortage only after regularize-to-Present" rule needs the **regularization
+flow**, which is *not yet built* — it should land before (or with) shortage going live in payroll.
+
+## Suggested build order
+1. Regularization flow (prerequisite).
+2. Canonical `daily_hours` + portal reads it (kills drift) — low risk, independent.
+3. `declaredOtMins` + the core per-day formula.
+4. Paid WO status + ledger debit.
+5. Sunday/holiday authorization + all-hours OT.
+6. `settlements/{YYYY-MM}` + month lock + payroll wiring.
+7. Manual OT entry + retire lifetime counters.
 
 ## Relevant code (current)
 
