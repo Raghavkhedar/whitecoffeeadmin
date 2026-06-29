@@ -361,11 +361,37 @@ export async function approveOt(
   reason: string,
   approverName: string,
 ): Promise<void> {
+  await writeOtDecision(user, date, requestedMins, approvedMins, 'approved', reason, approverName);
+}
+
+// Reject a day's overtime: records a 0-minute decision so the day stops showing as pending
+// and is logged in history. Reason required (enforced by the caller).
+export async function rejectOt(
+  user: Pick<User, 'id' | 'name' | 'employeeId' | 'role'>,
+  date: string,
+  requestedMins: number,
+  reason: string,
+  approverName: string,
+): Promise<void> {
+  await writeOtDecision(user, date, requestedMins, 0, 'rejected', reason, approverName);
+}
+
+// Shared writer for an OT decision (approve/reject). Recomputes the user's lifetime
+// approvedOtMins by summing granted minutes across all decisions (rejected contribute 0).
+async function writeOtDecision(
+  user: Pick<User, 'id' | 'name' | 'employeeId' | 'role'>,
+  date: string,
+  requestedMins: number,
+  approvedMins: number,
+  status: 'approved' | 'rejected',
+  reason: string,
+  approverName: string,
+): Promise<void> {
   await setDoc(
     doc(db, 'users', user.id, 'ot_approvals', date),
     {
       date, userId: user.id, userName: user.name || '', employeeId: user.employeeId || '',
-      role: user.role || '', requestedMins, approvedMins, reason,
+      role: user.role || '', requestedMins, approvedMins, status, reason,
       approvedBy: approverName, approvedAt: Timestamp.now(),
     },
     { merge: true },

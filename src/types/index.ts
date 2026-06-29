@@ -27,7 +27,8 @@ export interface OtApproval {
   employeeId: string;
   role: string;
   requestedMins: number; // OT minutes the system detected for that day
-  approvedMins: number;  // minutes the admin actually granted
+  approvedMins: number;  // minutes the admin actually granted (0 when rejected)
+  status?: 'approved' | 'rejected'; // decision outcome (older docs without this are 'approved')
   reason: string;
   approvedBy: string;
   approvedAt?: Timestamp;

@@ -3,7 +3,7 @@ import { useEffect, useState, useMemo, useCallback } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import { doc, getDoc } from 'firebase/firestore';
 import { auth, db } from '@/lib/firebase';
-import { getAllUsers, getAttendanceForDateRange, getPlannedHoursForDateRange, getOtApprovalsForDateRange, getHolidaysForDateRange, approveOt } from '@/lib/firestore';
+import { getAllUsers, getAttendanceForDateRange, getPlannedHoursForDateRange, getOtApprovalsForDateRange, getHolidaysForDateRange, approveOt, rejectOt } from '@/lib/firestore';
 import type { User, AttendanceRecord, PlannedHours, OtApproval, Holiday } from '@/types';
 import { RoleBadge } from '@/components/ui';
 import ExportButton from '@/components/ExportButton';
@@ -264,6 +264,20 @@ function OtModal({ row, adminName, onClose, onApproved }: {
     setSaving('');
   }
 
+  async function reject(day: DayOt) {
+    const draft = drafts[day.date];
+    if (!draft.reason.trim()) { setError('A reason is required to reject overtime.'); return; }
+    setError('');
+    setSaving(day.date);
+    try {
+      await rejectOt(row.user, day.date, day.pendingExtraMins, draft.reason.trim(), adminName);
+      onApproved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to reject. Try again.');
+    }
+    setSaving('');
+  }
+
   const lifetime = row.user.approvedOtMins ?? 0;
 
   return (
@@ -307,9 +321,12 @@ function OtModal({ row, adminName, onClose, onApproved }: {
                     placeholder="e.g. extra site visit at client request" className="input" />
                 </div>
               </div>
-              <div className="flex justify-end mt-3">
+              <div className="flex justify-end gap-2 mt-3">
+                <button onClick={() => reject(day)} disabled={saving === day.date} className="btn-danger !py-1.5 !px-4 text-[13px]">
+                  {saving === day.date ? 'Saving…' : 'Reject'}
+                </button>
                 <button onClick={() => approve(day)} disabled={saving === day.date} className="btn-success !py-1.5 !px-4 text-[13px]">
-                  {saving === day.date ? 'Approving…' : `Approve ${minutesToDisplay(Math.min(day.pendingExtraMins, Math.max(0, Math.round(Number(drafts[day.date]?.mins) || 0))))}`}
+                  {saving === day.date ? 'Saving…' : `Approve ${minutesToDisplay(Math.min(day.pendingExtraMins, Math.max(0, Math.round(Number(drafts[day.date]?.mins) || 0))))}`}
                 </button>
               </div>
             </div>
@@ -317,17 +334,24 @@ function OtModal({ row, adminName, onClose, onApproved }: {
 
           {row.approvedInRange.length > 0 && (
             <div>
-              <div className="label mb-2">Already approved in this range</div>
+              <div className="label mb-2">Decisions in this range</div>
               <div className="space-y-2">
-                {row.approvedInRange.map(a => (
-                  <div key={a.date} className="flex items-start justify-between bg-[#FBFAF8] border border-[#F0EEEB] rounded-lg px-3 py-2 text-sm">
-                    <div>
-                      <div className="font-medium text-text-primary">{fmtDay(a.date)}</div>
-                      <div className="text-xs text-text-secondary">{a.reason}{a.approvedBy ? ` · ${a.approvedBy}` : ''}</div>
+                {row.approvedInRange.map(a => {
+                  const rejected = a.status === 'rejected';
+                  return (
+                    <div key={a.date} className={`flex items-start justify-between border rounded-lg px-3 py-2 text-sm ${rejected ? 'bg-[#FCF7F7] border-[#F4E4E4]' : 'bg-[#FBFAF8] border-[#F0EEEB]'}`}>
+                      <div>
+                        <div className="font-medium text-text-primary">{fmtDay(a.date)}</div>
+                        <div className="text-xs text-text-secondary">{a.reason}{a.approvedBy ? ` · ${a.approvedBy}` : ''}</div>
+                      </div>
+                      {rejected ? (
+                        <span className="text-[11px] font-semibold bg-[#FBEAEA] text-[#C42B2B] px-2 py-0.5 rounded whitespace-nowrap self-center">Rejected</span>
+                      ) : (
+                        <span className="font-mono text-[#0A7A50] font-semibold whitespace-nowrap">+{minutesToDisplay(a.approvedMins)}</span>
+                      )}
                     </div>
-                    <span className="font-mono text-[#0A7A50] font-semibold whitespace-nowrap">+{minutesToDisplay(a.approvedMins)}</span>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}

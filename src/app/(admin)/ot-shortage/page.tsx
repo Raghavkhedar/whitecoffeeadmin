@@ -3,7 +3,7 @@ import { useEffect, useState, useMemo, useCallback } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import { doc, getDoc } from 'firebase/firestore';
 import { auth, db } from '@/lib/firebase';
-import { getAllUsers, getAttendanceForDateRange, getPlannedHoursForDateRange, getOtApprovalsForDateRange, getHolidaysForDateRange, getAttendanceStatusForDateRange, approveOt } from '@/lib/firestore';
+import { getAllUsers, getAttendanceForDateRange, getPlannedHoursForDateRange, getOtApprovalsForDateRange, getHolidaysForDateRange, getAttendanceStatusForDateRange, approveOt, rejectOt } from '@/lib/firestore';
 import type { User, AttendanceRecord, PlannedHours, OtApproval, Holiday, AttendanceStatus } from '@/types';
 import { RoleBadge } from '@/components/ui';
 import ExportButton from '@/components/ExportButton';
@@ -87,6 +87,16 @@ function formatTime(secs: number): string {
   });
 }
 
+// "18:30" → "6:30 PM"; returns '' for blank/invalid input.
+function fmtHHMM(hhmm?: string): string {
+  if (!hhmm || !hhmm.includes(':')) return '';
+  const [h, m] = hhmm.split(':').map(Number);
+  if (Number.isNaN(h) || Number.isNaN(m)) return '';
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
+}
+
 const OFFICE_DAY_MINS = 8 * 60;
 const WO_DEBIT_MINS = 8 * 60; // a WO (paid no-work day off) owes a standard 8h, payable by OT
 
@@ -99,6 +109,8 @@ const OPS_OUT_TYPES = new Set(['site_out', 'market_out']);
 interface DayDetail {
   date: string;
   plannedMins: number;      // shift window
+  plannedStart: string;     // shift start "HH:MM" (ops) — '' if none
+  plannedEnd: string;       // shift end "HH:MM" (ops) — '' if none
   declaredOtMins: number;   // admin pre-declared OT for the day
   actualMins: number;
   autoOtMins: number;       // pre-authorized OT actually worked = min(surplus, declared) → no review
@@ -144,10 +156,10 @@ function aggregateForEmployee(
   const userEvents = allEvents.filter(e => e.userId === user.id);
 
   // Planned shift + declared-OT minutes per date (ops use admin-set windows)
-  const plannedByDate = new Map<string, { planned: number; declared: number }>();
+  const plannedByDate = new Map<string, { planned: number; declared: number; startTime: string; endTime: string }>();
   plannedItems.filter(p => p.userId === user.id).forEach(p => {
     const dur = hhmmToMinutes(p.endTime) - hhmmToMinutes(p.startTime);
-    if (dur > 0) plannedByDate.set(p.date, { planned: dur, declared: Math.max(0, p.declaredOtMins ?? 0) });
+    if (dur > 0) plannedByDate.set(p.date, { planned: dur, declared: Math.max(0, p.declaredOtMins ?? 0), startTime: p.startTime, endTime: p.endTime });
   });
 
   let workingMins: number | null;
@@ -196,11 +208,12 @@ function aggregateForEmployee(
 
     if (globalLastOut === null || lastOut > globalLastOut) globalLastOut = lastOut;
 
-    const planInfo    = isOps ? plannedByDate.get(date) : { planned: OFFICE_DAY_MINS, declared: 0 };
+    const planInfo    = isOps ? plannedByDate.get(date) : { planned: OFFICE_DAY_MINS, declared: 0, startTime: '10:00', endTime: '18:00' };
     const plannedDay  = planInfo?.planned ?? 0;
     const declaredDay = planInfo?.declared ?? 0;
     const detail: DayDetail = {
-      date, plannedMins: plannedDay, declaredOtMins: declaredDay, actualMins: dayMins,
+      date, plannedMins: plannedDay, plannedStart: planInfo?.startTime ?? '', plannedEnd: planInfo?.endTime ?? '',
+      declaredOtMins: declaredDay, actualMins: dayMins,
       autoOtMins: 0, pendingExtraMins: 0, shortageMins: 0, firstInSecs: firstIn, lastOutSecs: lastOut,
     };
 
@@ -302,6 +315,20 @@ function DetailModal({ row, adminName, onClose, onApproved }: {
     setSaving('');
   }
 
+  async function reject(day: DayDetail) {
+    const draft = drafts[day.date];
+    if (!draft.reason.trim()) { setError('A reason is required to reject overtime.'); return; }
+    setError('');
+    setSaving(day.date);
+    try {
+      await rejectOt(row.user, day.date, day.pendingExtraMins, draft.reason.trim(), adminName);
+      onApproved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to reject. Try again.');
+    }
+    setSaving('');
+  }
+
   const lifetimeOt = row.user.approvedOtMins ?? 0;
   const lifetimeShortage = row.user.shortageMins ?? 0;
 
@@ -347,14 +374,21 @@ function DetailModal({ row, adminName, onClose, onApproved }: {
                     <div key={day.date} className="border border-border rounded-xl p-4">
                       <div className="flex items-center justify-between mb-3">
                         <div className="font-semibold text-text-primary text-sm">{fmtDay(day.date)}</div>
-                        <div className="text-xs text-text-secondary font-mono">
-                          Planned {minutesToDisplay(day.plannedMins)}
-                          {day.autoOtMins > 0 && <> · <span className="text-[#0A7A50]">+{minutesToDisplay(day.autoOtMins)} auto</span></>}
-                          {' '}· Worked {minutesToDisplay(day.actualMins)} ·
-                          <span className="text-[#9A5B1E] font-semibold"> +{minutesToDisplay(day.pendingExtraMins)} to review</span>
-                        </div>
+                        <span className="text-[11px] font-semibold bg-[#FDF3E4] text-[#B26B07] px-2 py-0.5 rounded">+{minutesToDisplay(day.pendingExtraMins)} to review</span>
                       </div>
-                      <div className="text-[11px] text-text-secondary font-mono mb-3">{formatTime(day.firstInSecs)} – {formatTime(day.lastOutSecs)}</div>
+
+                      {/* Detailed breakdown: planned shift, actual punches, OT split */}
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs mb-3 bg-[#FBFAF8] border border-[#F0EEEB] rounded-lg p-3">
+                        <div className="flex justify-between"><span className="text-text-secondary">Planned shift</span><span className="font-mono text-text-primary">{day.plannedStart ? `${fmtHHMM(day.plannedStart)} – ${fmtHHMM(day.plannedEnd)}` : '—'}</span></div>
+                        <div className="flex justify-between"><span className="text-text-secondary">Planned hrs</span><span className="font-mono text-text-primary">{minutesToDisplay(day.plannedMins)}</span></div>
+                        <div className="flex justify-between"><span className="text-text-secondary">Checked in / out</span><span className="font-mono text-text-primary">{formatTime(day.firstInSecs)} – {formatTime(day.lastOutSecs)}</span></div>
+                        <div className="flex justify-between"><span className="text-text-secondary">Worked hrs</span><span className="font-mono text-text-primary">{minutesToDisplay(day.actualMins)}</span></div>
+                        <div className="flex justify-between"><span className="text-text-secondary">OT after</span><span className="font-mono text-text-primary">{day.plannedEnd ? fmtHHMM(day.plannedEnd) : '—'}</span></div>
+                        <div className="flex justify-between"><span className="text-text-secondary">Declared OT</span><span className="font-mono text-text-primary">{minutesToDisplay(day.declaredOtMins)}</span></div>
+                        <div className="flex justify-between"><span className="text-text-secondary">Auto-approved</span><span className="font-mono text-[#0A7A50]">+{minutesToDisplay(day.autoOtMins)}</span></div>
+                        <div className="flex justify-between"><span className="text-text-secondary">Pending review</span><span className="font-mono text-[#9A5B1E] font-semibold">+{minutesToDisplay(day.pendingExtraMins)}</span></div>
+                      </div>
+
                       <div className="grid grid-cols-[120px_1fr] gap-3 items-start">
                         <div>
                           <label className="label">Grant (min)</label>
@@ -367,9 +401,12 @@ function DetailModal({ row, adminName, onClose, onApproved }: {
                             placeholder="e.g. extra site visit at client request" className="input" />
                         </div>
                       </div>
-                      <div className="flex justify-end mt-3">
+                      <div className="flex justify-end gap-2 mt-3">
+                        <button onClick={() => reject(day)} disabled={saving === day.date} className="btn-danger !py-1.5 !px-4 text-[13px]">
+                          {saving === day.date ? 'Saving…' : 'Reject'}
+                        </button>
                         <button onClick={() => approve(day)} disabled={saving === day.date} className="btn-success !py-1.5 !px-4 text-[13px]">
-                          {saving === day.date ? 'Approving…' : `Approve ${minutesToDisplay(Math.min(day.pendingExtraMins, Math.max(0, Math.round(Number(drafts[day.date]?.mins) || 0))))}`}
+                          {saving === day.date ? 'Saving…' : `Approve ${minutesToDisplay(Math.min(day.pendingExtraMins, Math.max(0, Math.round(Number(drafts[day.date]?.mins) || 0))))}`}
                         </button>
                       </div>
                     </div>
@@ -379,10 +416,10 @@ function DetailModal({ row, adminName, onClose, onApproved }: {
             </div>
           )}
 
-          {/* Approved overtime — history (operations only). Combines pre-declared (auto) + granted. */}
+          {/* OT decisions — history (operations only): pre-declared auto, plus admin approve/reject. */}
           {row.isOps && (row.approvedInRange.length > 0 || row.autoOtRangeMins > 0) && (
             <div>
-              <div className="label mb-2">Approved overtime · +{minutesToDisplay(row.autoOtRangeMins + row.approvedOtRangeMins)}</div>
+              <div className="label mb-2">OT decisions · approved +{minutesToDisplay(row.autoOtRangeMins + row.approvedOtRangeMins)}</div>
               {row.autoOtRangeMins > 0 && (
                 <div className="flex items-start justify-between bg-[#EAF7F0] border border-[#D6EFE0] rounded-lg px-3 py-2 text-sm mb-2">
                   <div>
@@ -393,15 +430,22 @@ function DetailModal({ row, adminName, onClose, onApproved }: {
                 </div>
               )}
               <div className="space-y-2">
-                {row.approvedInRange.map(a => (
-                  <div key={a.date} className="flex items-start justify-between bg-[#FBFAF8] border border-[#F0EEEB] rounded-lg px-3 py-2 text-sm">
-                    <div>
-                      <div className="font-medium text-text-primary">{fmtDay(a.date)}</div>
-                      <div className="text-xs text-text-secondary">{a.reason}{a.approvedBy ? ` · ${a.approvedBy}` : ''}</div>
+                {row.approvedInRange.map(a => {
+                  const rejected = a.status === 'rejected';
+                  return (
+                    <div key={a.date} className={`flex items-start justify-between border rounded-lg px-3 py-2 text-sm ${rejected ? 'bg-[#FCF7F7] border-[#F4E4E4]' : 'bg-[#FBFAF8] border-[#F0EEEB]'}`}>
+                      <div>
+                        <div className="font-medium text-text-primary">{fmtDay(a.date)}</div>
+                        <div className="text-xs text-text-secondary">{a.reason}{a.approvedBy ? ` · ${a.approvedBy}` : ''}</div>
+                      </div>
+                      {rejected ? (
+                        <span className="text-[11px] font-semibold bg-[#FBEAEA] text-[#C42B2B] px-2 py-0.5 rounded whitespace-nowrap self-center">Rejected</span>
+                      ) : (
+                        <span className="font-mono text-[#0A7A50] font-semibold whitespace-nowrap">+{minutesToDisplay(a.approvedMins)}</span>
+                      )}
                     </div>
-                    <span className="font-mono text-[#0A7A50] font-semibold whitespace-nowrap">+{minutesToDisplay(a.approvedMins)}</span>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
