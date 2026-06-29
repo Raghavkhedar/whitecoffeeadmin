@@ -25,6 +25,55 @@ function hhmmToMinutes(s: string | undefined, fallback: number): number {
   return Number.isNaN(h) || Number.isNaN(m) ? fallback : h * 60 + m;
 }
 
+type Visit = { in?: AttendanceRecord; out?: AttendanceRecord };
+
+// Pair check-ins with check-outs chronologically so a visit's "out" is always the
+// next out *after* its "in" — never matched by list position (which broke when the
+// counts/order of in/out events didn't alternate cleanly, e.g. auto-logouts or
+// mixed site+market visits). Ops spans site+market events; office uses office_in/out.
+function buildVisits(events: AttendanceRecord[], isOps: boolean): Visit[] {
+  const ts    = (e: AttendanceRecord) => (e.timestamp as unknown as { seconds: number })?.seconds ?? 0;
+  const isIn  = (e: AttendanceRecord) => isOps ? (e.type === 'site_in'  || e.type === 'market_in')  : e.type === 'office_in';
+  const isOut = (e: AttendanceRecord) => isOps ? (e.type === 'site_out' || e.type === 'market_out') : e.type === 'office_out';
+  const ordered = events.filter(e => isIn(e) || isOut(e)).sort((a, b) => ts(a) - ts(b));
+  const visits: Visit[] = [];
+  let current: Visit | null = null;
+  for (const e of ordered) {
+    if (isIn(e)) {
+      if (current) visits.push(current);   // previous in had no out — keep it open
+      current = { in: e };
+    } else if (current && !current.out) {
+      current.out = e;                      // close the open visit
+      visits.push(current);
+      current = null;
+    } else {
+      visits.push({ out: e });             // orphan out (no preceding open in)
+    }
+  }
+  if (current) visits.push(current);
+  return visits;
+}
+
+function visitLocation(v: Visit): string {
+  return v.in?.siteName || v.in?.marketName || v.out?.siteName || v.out?.marketName || '';
+}
+
+function VisitCell({ visit }: { visit?: Visit | null }) {
+  if (!visit) return <span className="text-text-secondary/50">—</span>;
+  const loc = visitLocation(visit);
+  return (
+    <div>
+      <span>{formatTime(visit.in?.timestamp)}</span>
+      <span className="mx-1">–</span>
+      <span>{formatTime(visit.out?.timestamp)}</span>
+      {visit.out?.autoLogout && (
+        <span className="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-rose-50 text-rose-600 border border-rose-200 font-medium">auto</span>
+      )}
+      {loc && <div className="text-[10px] text-text-secondary/70 mt-0.5">{loc}</div>}
+    </div>
+  );
+}
+
 // Mirrors the computeDailyAttendanceStatus Cloud Function for live (pre-23:59) display.
 // Office/admin: fixed 10:00–18:00 window, office_in/office_out events.
 // Operations: planned shift window (required), first site_in / last site_out events.
@@ -302,8 +351,11 @@ export default function AttendancePage() {
     const rows = list.map(user => {
       const isOps = user.role === 'operations';
       const evs   = selectedEvents.filter(e => e.userId === user.id);
-      const ins   = evs.filter(e => e.type === (isOps ? 'site_in'  : 'office_in')).sort((a, b) => tsOf(a) - tsOf(b));
-      const outs  = evs.filter(e => e.type === (isOps ? 'site_out' : 'office_out')).sort((a, b) => tsOf(a) - tsOf(b));
+      // Ops field-work spans both site and market visits (matches buildVisits / status logic).
+      const isIn  = (e: AttendanceRecord) => isOps ? (e.type === 'site_in'  || e.type === 'market_in')  : e.type === 'office_in';
+      const isOut = (e: AttendanceRecord) => isOps ? (e.type === 'site_out' || e.type === 'market_out') : e.type === 'office_out';
+      const ins   = evs.filter(isIn).sort((a, b) => tsOf(a) - tsOf(b));
+      const outs  = evs.filter(isOut).sort((a, b) => tsOf(a) - tsOf(b));
       const plan  = selectedPlanMap.get(user.id);
       return {
         Date: selectedDate,
@@ -598,12 +650,11 @@ export default function AttendancePage() {
                     const isDirty    = dirtyPlans.has(saveKey);
 
                     const userEvents   = eventsLoading ? [] : selectedEvents.filter(e => e.userId === user.id);
-                    const ts = (e: AttendanceRecord) => (e.timestamp as unknown as { seconds: number })?.seconds ?? 0;
 
-                    const officeIns  = userEvents.filter(e => e.type === 'office_in').sort((a, b) => ts(a) - ts(b));
-                    const officeOuts = userEvents.filter(e => e.type === 'office_out').sort((a, b) => ts(a) - ts(b));
-                    const siteIns    = userEvents.filter(e => e.type === 'site_in').sort((a, b) => ts(a) - ts(b));
-                    const siteOuts   = userEvents.filter(e => e.type === 'site_out').sort((a, b) => ts(a) - ts(b));
+                    // Chronologically paired visits; first/last visit drive the two columns.
+                    const visits     = buildVisits(userEvents, isOps);
+                    const firstVisit = visits[0] ?? null;
+                    const lastVisit  = visits.length > 1 ? visits[visits.length - 1] : null;
                     const planned      = selectedPlanMap.get(user.id);
                     const hasPlan      = !!(planned?.startTime && planned?.endTime);
                     // Derive status live from events (+ planned window for ops) until the Cloud
@@ -665,53 +716,10 @@ export default function AttendancePage() {
                           )}
                         </td>
                         <td className="py-3 pr-4 text-text-secondary text-xs">
-                          {eventsLoading ? '…' : isOps ? (
-                            siteIns[0] ? (
-                              <div>
-                                <span>{formatTime(siteIns[0].timestamp as Parameters<typeof formatTime>[0])}</span>
-                                <span className="mx-1">–</span>
-                                <span>{siteOuts[0] ? formatTime(siteOuts[0].timestamp as Parameters<typeof formatTime>[0]) : '—'}</span>
-                                {siteOuts[0]?.autoLogout && (
-                                  <span className="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-rose-50 text-rose-600 border border-rose-200 font-medium">auto</span>
-                                )}
-                                <div className="text-[10px] text-text-secondary/70 mt-0.5">{siteIns[0].siteName || siteIns[0].marketName || ''}</div>
-                              </div>
-                            ) : '—'
-                          ) : (
-                            officeIns[0] ? (
-                              <span>
-                                {formatTime(officeIns[0].timestamp as Parameters<typeof formatTime>[0])}
-                                <span className="mx-1">–</span>
-                                {officeOuts[0] ? (
-                                  <span className="inline-flex items-center gap-1">
-                                    {formatTime(officeOuts[0].timestamp as Parameters<typeof formatTime>[0])}
-                                    {officeOuts[0].autoLogout && (
-                                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-50 text-rose-600 border border-rose-200 font-medium">auto</span>
-                                    )}
-                                  </span>
-                                ) : '—'}
-                              </span>
-                            ) : '—'
-                          )}
+                          {eventsLoading ? '…' : <VisitCell visit={firstVisit} />}
                         </td>
                         <td className="py-3 pr-4 text-text-secondary text-xs">
-                          {eventsLoading ? '…' : isOps ? (
-                            siteIns.length > 1 ? (
-                              <div>
-                                <span>{formatTime(siteIns[siteIns.length - 1].timestamp as Parameters<typeof formatTime>[0])}</span>
-                                <span className="mx-1">–</span>
-                                <span>{siteOuts.length > 0 ? formatTime(siteOuts[siteOuts.length - 1].timestamp as Parameters<typeof formatTime>[0]) : '—'}</span>
-                                {siteOuts.length > 0 && siteOuts[siteOuts.length - 1].autoLogout && (
-                                  <span className="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-rose-50 text-rose-600 border border-rose-200 font-medium">auto</span>
-                                )}
-                                <div className="text-[10px] text-text-secondary/70 mt-0.5">{siteIns[siteIns.length - 1].siteName || siteIns[siteIns.length - 1].marketName || ''}</div>
-                              </div>
-                            ) : (
-                              <span className="text-text-secondary/50">—</span>
-                            )
-                          ) : (
-                            <span className="text-text-secondary/50">—</span>
-                          )}
+                          {eventsLoading ? '…' : <VisitCell visit={lastVisit} />}
                         </td>
                         <td className="py-3 text-text-secondary text-xs">
                           {user.plBalance !== undefined ? (
