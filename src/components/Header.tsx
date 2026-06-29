@@ -13,6 +13,7 @@ const TITLES: Record<string, { title: string; subtitle: string }> = {
   '/leaves':              { title: 'Leave Requests',      subtitle: 'Review and approve time-off requests' },
   '/regularization':      { title: 'Regularization',      subtitle: 'Review attendance correction requests' },
   '/attendance':          { title: 'Attendance',          subtitle: 'Daily status & planned shifts' },
+  '/ot-shortage':         { title: 'OT & Shortage',       subtitle: 'Review overtime and track shortage for operations' },
   '/site-ids':            { title: 'Site IDs',            subtitle: 'Assign site codes to operations check-ins' },
   '/conveyance':          { title: 'Conveyance',          subtitle: 'Monthly travel reimbursements' },
   '/submissions':         { title: 'Submissions',         subtitle: 'Material, tools, work progress & conveyance' },

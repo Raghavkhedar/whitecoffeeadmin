@@ -20,8 +20,9 @@ const NAV_GROUPS: { label?: string; items: NavItem[] }[] = [
     { href: '/regularization',     icon: 'clock',      label: 'Regularization' },
   ] },
   { label: 'Time & Sites', items: [
-    { href: '/attendance', icon: 'calendar', label: 'Attendance' },
-    { href: '/site-ids',   icon: 'pin',      label: 'Site IDs' },
+    { href: '/attendance',  icon: 'calendar', label: 'Attendance' },
+    { href: '/ot-shortage', icon: 'clock',    label: 'OT & Shortage' },
+    { href: '/site-ids',    icon: 'pin',      label: 'Site IDs' },
   ] },
   { label: 'Records', items: [
     { href: '/submissions',   icon: 'doc',  label: 'Submissions' },

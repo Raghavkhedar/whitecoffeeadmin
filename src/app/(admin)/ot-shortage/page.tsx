@@ -15,7 +15,6 @@ import { istTodayStr, istDaysAgoStr } from '@/lib/date';
 type Preset = 'custom' | '1d' | '7d' | '15d' | '30d' | '90d' | '180d' | '365d';
 
 const PRESETS: { key: Preset; label: string; days: number | null }[] = [
-  { key: 'custom', label: 'Custom Date', days: null },
   { key: '1d',    label: 'Today',        days: 1   },
   { key: '7d',    label: 'Last 7 Days',  days: 7   },
   { key: '15d',   label: 'Last 15 Days', days: 15  },
@@ -23,6 +22,7 @@ const PRESETS: { key: Preset; label: string; days: number | null }[] = [
   { key: '90d',   label: 'Last 3 Months',days: 90  },
   { key: '180d',  label: 'Last 6 Months',days: 180 },
   { key: '365d',  label: 'Last Year',    days: 365 },
+  { key: 'custom', label: 'Custom Range', days: null },
 ];
 
 function todayStr() {
@@ -33,8 +33,9 @@ function nDaysAgo(n: number): string {
   return istDaysAgoStr(n);
 }
 
-function dateRangeFromPreset(preset: Preset, customDate: string): { start: string; end: string } {
-  if (preset === 'custom') return { start: customDate, end: customDate };
+function dateRangeFromPreset(preset: Preset, customStart: string, customEnd: string): { start: string; end: string } {
+  if (preset === 'custom') return { start: customStart, end: customEnd };
+  if (preset === '1d') return { start: todayStr(), end: todayStr() };
   const p = PRESETS.find(p => p.key === preset)!;
   return { start: nDaysAgo(p.days!), end: todayStr() };
 }
@@ -50,13 +51,13 @@ function fmtDay(s: string): string {
 }
 
 // Count Mon–Sat days (no Sundays, no company holidays) in a date range, inclusive.
-function countWorkingDays(start: string, end: string, holidays?: Set<string>): number {
+function countWorkingDays(start: string, end: string, holidays: Set<string>): number {
   let count = 0;
   const d = new Date(start + 'T12:00:00');
   const e = new Date(end + 'T12:00:00');
   while (d <= e) {
     const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    if (d.getDay() !== 0 && !holidays?.has(ds)) count++;
+    if (d.getDay() !== 0 && !holidays.has(ds)) count++;
     d.setDate(d.getDate() + 1);
   }
   return count;
@@ -80,34 +81,45 @@ function tsSeconds(e: AttendanceRecord): number {
   return (e.timestamp as unknown as { seconds: number })?.seconds ?? 0;
 }
 
-const OFFICE_DAY_MINS = 8 * 60;
-
-// Field-work event types for operations (home events excluded — commute bookends)
-const OPS_IN_TYPES  = new Set(['site_in', 'market_in']);
-const OPS_OUT_TYPES = new Set(['site_out', 'market_out']);
-
 function formatTime(secs: number): string {
   return new Date(secs * 1000).toLocaleTimeString('en-IN', {
     hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata',
   });
 }
 
+const OFFICE_DAY_MINS = 8 * 60;
+
+// Field-work event types for operations (home events excluded — commute bookends)
+const OPS_IN_TYPES  = new Set(['site_in', 'market_in']);
+const OPS_OUT_TYPES = new Set(['site_out', 'market_out']);
+
 // ── Per-employee aggregation ──────────────────────────────────────────────────
 
-interface DayOt { date: string; plannedMins: number; actualMins: number; otMins: number }
+interface DayDetail {
+  date: string;
+  plannedMins: number;
+  actualMins: number;
+  otMins: number;        // > 0 only when actual exceeds plan (ops only)
+  shortageMins: number;  // > 0 only when actual falls short of plan (ops only)
+  firstInSecs: number;
+  lastOutSecs: number;
+}
 
-interface EmployeeRow {
+interface EmpRow {
   user: User;
-  workingMins: number | null;  // null = no plan (ops only)
-  actualMins: number | null;   // null = no events
-  shortageMins: number;        // sum of per-day shortfalls (only days worked with a known plan)
-  pendingOt: DayOt[];          // OT days in range not yet approved
+  isOps: boolean;
+  workingMins: number | null;  // expected (ops: planned windows; office/admin: 8h × working days)
+  actualMins: number | null;   // null = no worked days
+  firstInSecs: number | null;  // earliest in across range (for single-day view)
+  lastOutSecs: number | null;  // latest out across range
+  workedDays: DayDetail[];     // every fully-worked day, with check-in/out
+  // OT/shortage — operations only
+  shortageRangeMins: number;
+  pendingOt: DayDetail[];
   pendingOtMins: number;
-  approvedOtRangeMins: number; // approved OT minutes within the selected range
   approvedInRange: OtApproval[];
-  // Single-day extras
-  firstInSecs: number | null;
-  lastOutSecs: number | null;
+  approvedOtRangeMins: number;
+  shortageDays: DayDetail[];
 }
 
 function aggregateForEmployee(
@@ -118,19 +130,17 @@ function aggregateForEmployee(
   start: string,
   end: string,
   holidays: Set<string>,
-): EmployeeRow {
-  const isSingleDay = start === end;
+): EmpRow {
   const isOps = user.role === 'operations';
   const userEvents = allEvents.filter(e => e.userId === user.id);
 
-  // Planned minutes per date (ops use admin-set windows; office/admin fixed 8h)
+  // Planned minutes per date (ops use admin-set windows)
   const plannedByDate = new Map<string, number>();
   plannedItems.filter(p => p.userId === user.id).forEach(p => {
     const dur = hhmmToMinutes(p.endTime) - hhmmToMinutes(p.startTime);
     if (dur > 0) plannedByDate.set(p.date, dur);
   });
 
-  // ── Working minutes (range expected) ───────────────────────────────────
   let workingMins: number | null;
   if (isOps) {
     let total = 0;
@@ -140,7 +150,7 @@ function aggregateForEmployee(
     workingMins = countWorkingDays(start, end, holidays) * OFFICE_DAY_MINS;
   }
 
-  // ── Per-day actual minutes, OT and shortage ────────────────────────────
+  // Group events per day
   const eventsByDate = new Map<string, AttendanceRecord[]>();
   userEvents.forEach(e => {
     if (!eventsByDate.has(e.date)) eventsByDate.set(e.date, []);
@@ -149,8 +159,10 @@ function aggregateForEmployee(
 
   let totalActualMins = 0;
   let hasAnyActual = false;
-  let shortageMins = 0;
-  const otDays: DayOt[] = [];
+  let shortageRangeMins = 0;
+  const otDays: DayDetail[] = [];
+  const shortageDays: DayDetail[] = [];
+  const workedDays: DayDetail[] = [];
   let globalFirstIn: number | null = null;
   let globalLastOut: number | null = null;
 
@@ -159,8 +171,8 @@ function aggregateForEmployee(
     const outEvents = dayEvents.filter(e => isOps ? OPS_OUT_TYPES.has(e.type) : e.type === 'office_out');
     if (inEvents.length === 0) return; // no check-in → nothing to show
 
-    const firstIn  = Math.min(...inEvents.map(tsSeconds));
-    const lastOut  = outEvents.length ? Math.max(...outEvents.map(tsSeconds)) : null;
+    const firstIn = Math.min(...inEvents.map(tsSeconds));
+    const lastOut = outEvents.length ? Math.max(...outEvents.map(tsSeconds)) : null;
     if (globalFirstIn === null || firstIn < globalFirstIn) globalFirstIn = firstIn;
 
     // Open day — checked in but not yet checked out. Final hours can't be measured,
@@ -174,17 +186,24 @@ function aggregateForEmployee(
 
     if (globalLastOut === null || lastOut > globalLastOut) globalLastOut = lastOut;
 
-    // Planned for this day → derive OT / shortage (absent days never reach here).
-    // Holidays are skipped like Sundays — worked hours still show in Actual, but
-    // the day carries no expected window, so no shortage penalty or OT credit.
     const plannedDay = isOps ? plannedByDate.get(date) : OFFICE_DAY_MINS;
-    if (!holidays.has(date) && plannedDay && plannedDay > 0) {
-      if (dayMins > plannedDay) otDays.push({ date, plannedMins: plannedDay, actualMins: dayMins, otMins: dayMins - plannedDay });
-      else if (dayMins < plannedDay) shortageMins += plannedDay - dayMins;
+    const detail: DayDetail = { date, plannedMins: plannedDay ?? 0, actualMins: dayMins, otMins: 0, shortageMins: 0, firstInSecs: firstIn, lastOutSecs: lastOut };
+
+    // OT / shortage only for operations, and only on days with an expected window.
+    // Holidays carry no window → worked hours still count, but no OT/shortage.
+    if (isOps && !holidays.has(date) && plannedDay && plannedDay > 0) {
+      if (dayMins > plannedDay) {
+        detail.otMins = dayMins - plannedDay;
+        otDays.push(detail);
+      } else if (dayMins < plannedDay) {
+        detail.shortageMins = plannedDay - dayMins;
+        shortageRangeMins += detail.shortageMins;
+        shortageDays.push(detail);
+      }
     }
+    workedDays.push(detail);
   });
 
-  // Split OT days into pending vs already-approved
   const approvedByDate = new Map<string, OtApproval>();
   approvals.filter(a => a.userId === user.id).forEach(a => approvedByDate.set(a.date, a));
 
@@ -195,22 +214,25 @@ function aggregateForEmployee(
 
   return {
     user,
+    isOps,
     workingMins,
     actualMins: hasAnyActual ? totalActualMins : null,
-    shortageMins,
+    firstInSecs: globalFirstIn,
+    lastOutSecs: globalLastOut,
+    workedDays: workedDays.sort((a, b) => a.date.localeCompare(b.date)),
+    shortageRangeMins,
     pendingOt,
     pendingOtMins,
-    approvedOtRangeMins,
     approvedInRange,
-    firstInSecs: isSingleDay ? globalFirstIn : null,
-    lastOutSecs: isSingleDay ? globalLastOut : null,
+    approvedOtRangeMins,
+    shortageDays: shortageDays.sort((a, b) => a.date.localeCompare(b.date)),
   };
 }
 
-// ── OT approval modal ─────────────────────────────────────────────────────────
+// ── Drill-in modal: OT review/approval + shortage (ops) and worked days ────────
 
-function OtModal({ row, adminName, onClose, onApproved }: {
-  row: EmployeeRow;
+function DetailModal({ row, adminName, onClose, onApproved }: {
+  row: EmpRow;
   adminName: string;
   onClose: () => void;
   onApproved: () => void;
@@ -227,7 +249,7 @@ function OtModal({ row, adminName, onClose, onApproved }: {
     setDrafts(prev => ({ ...prev, [date]: { ...prev[date], [field]: value } }));
   }
 
-  async function approve(day: DayOt) {
+  async function approve(day: DayDetail) {
     const draft = drafts[day.date];
     // Grant is capped at the detected OT for the day — admin may approve less, never more.
     const mins  = Math.min(day.otMins, Math.max(0, Math.round(Number(draft.mins) || 0)));
@@ -243,58 +265,75 @@ function OtModal({ row, adminName, onClose, onApproved }: {
     setSaving('');
   }
 
-  const lifetime = row.user.approvedOtMins ?? 0;
+  const lifetimeOt = row.user.approvedOtMins ?? 0;
+  const lifetimeShortage = row.user.shortageMins ?? 0;
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 px-4" onClick={onClose}>
       <div className="bg-white rounded-2xl shadow-xl w-full max-w-2xl max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between p-5 border-b border-border">
           <div>
-            <h2 className="text-lg font-bold text-text-primary">Overtime — {row.user.name}</h2>
-            <p className="text-xs text-text-secondary mt-0.5 font-mono">{row.user.employeeId} · Lifetime approved OT: {minutesToDisplay(lifetime)}</p>
+            <div className="flex items-center gap-2">
+              <h2 className="text-lg font-bold text-text-primary">{row.user.name}</h2>
+              <RoleBadge role={row.user.role} />
+            </div>
+            <p className="text-xs text-text-secondary mt-0.5 font-mono">
+              {row.user.employeeId}
+              {row.isOps && <> · Lifetime OT <span className="text-[#0A7A50] font-semibold">{minutesToDisplay(lifetimeOt)}</span> · Lifetime shortage <span className="text-[#C42B2B] font-semibold">{minutesToDisplay(lifetimeShortage)}</span></>}
+            </p>
           </div>
           <button onClick={onClose} className="text-text-secondary hover:text-text-primary text-xl leading-none">×</button>
         </div>
 
-        <div className="overflow-y-auto p-5 space-y-4">
+        <div className="overflow-y-auto p-5 space-y-5">
           {error && <p className="text-sm text-red-600 bg-red-50 rounded-lg p-3">{error}</p>}
 
-          {row.pendingOt.length === 0 && (
-            <p className="text-sm text-text-secondary text-center py-4">No pending overtime to review in this range.</p>
+          {/* Pending overtime — actionable (operations only) */}
+          {row.isOps && (
+            <div>
+              <div className="label mb-2">Pending overtime · {row.pendingOt.length} day{row.pendingOt.length === 1 ? '' : 's'}</div>
+              {row.pendingOt.length === 0 ? (
+                <p className="text-sm text-text-secondary py-2">No pending overtime to review in this range.</p>
+              ) : (
+                <div className="space-y-3">
+                  {row.pendingOt.map(day => (
+                    <div key={day.date} className="border border-border rounded-xl p-4">
+                      <div className="flex items-center justify-between mb-3">
+                        <div className="font-semibold text-text-primary text-sm">{fmtDay(day.date)}</div>
+                        <div className="text-xs text-text-secondary font-mono">
+                          Planned {minutesToDisplay(day.plannedMins)} · Worked {minutesToDisplay(day.actualMins)} ·
+                          <span className="text-[#9A5B1E] font-semibold"> +{minutesToDisplay(day.otMins)} OT</span>
+                        </div>
+                      </div>
+                      <div className="text-[11px] text-text-secondary font-mono mb-3">{formatTime(day.firstInSecs)} – {formatTime(day.lastOutSecs)}</div>
+                      <div className="grid grid-cols-[120px_1fr] gap-3 items-start">
+                        <div>
+                          <label className="label">Grant (min)</label>
+                          <input type="number" min="0" max={day.otMins} value={drafts[day.date]?.mins ?? ''}
+                            onChange={e => set(day.date, 'mins', e.target.value)} className="input" />
+                        </div>
+                        <div>
+                          <label className="label">Reason <span className="text-red-500">*</span></label>
+                          <input value={drafts[day.date]?.reason ?? ''} onChange={e => set(day.date, 'reason', e.target.value)}
+                            placeholder="e.g. extra site visit at client request" className="input" />
+                        </div>
+                      </div>
+                      <div className="flex justify-end mt-3">
+                        <button onClick={() => approve(day)} disabled={saving === day.date} className="btn-success !py-1.5 !px-4 text-[13px]">
+                          {saving === day.date ? 'Approving…' : `Approve ${minutesToDisplay(Math.min(day.otMins, Math.max(0, Math.round(Number(drafts[day.date]?.mins) || 0))))}`}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
 
-          {row.pendingOt.map(day => (
-            <div key={day.date} className="border border-border rounded-xl p-4">
-              <div className="flex items-center justify-between mb-3">
-                <div className="font-semibold text-text-primary text-sm">{fmtDay(day.date)}</div>
-                <div className="text-xs text-text-secondary font-mono">
-                  Planned {minutesToDisplay(day.plannedMins)} · Worked {minutesToDisplay(day.actualMins)} ·
-                  <span className="text-[#9A5B1E] font-semibold"> +{minutesToDisplay(day.otMins)} OT</span>
-                </div>
-              </div>
-              <div className="grid grid-cols-[120px_1fr] gap-3 items-start">
-                <div>
-                  <label className="label">Grant (min)</label>
-                  <input type="number" min="0" max={day.otMins} value={drafts[day.date]?.mins ?? ''}
-                    onChange={e => set(day.date, 'mins', e.target.value)} className="input" />
-                </div>
-                <div>
-                  <label className="label">Reason <span className="text-red-500">*</span></label>
-                  <input value={drafts[day.date]?.reason ?? ''} onChange={e => set(day.date, 'reason', e.target.value)}
-                    placeholder="e.g. extra site visit at client request" className="input" />
-                </div>
-              </div>
-              <div className="flex justify-end mt-3">
-                <button onClick={() => approve(day)} disabled={saving === day.date} className="btn-success !py-1.5 !px-4 text-[13px]">
-                  {saving === day.date ? 'Approving…' : `Approve ${minutesToDisplay(Math.min(day.otMins, Math.max(0, Math.round(Number(drafts[day.date]?.mins) || 0))))}`}
-                </button>
-              </div>
-            </div>
-          ))}
-
-          {row.approvedInRange.length > 0 && (
+          {/* Approved overtime — history (operations only) */}
+          {row.isOps && row.approvedInRange.length > 0 && (
             <div>
-              <div className="label mb-2">Already approved in this range</div>
+              <div className="label mb-2">Approved overtime · +{minutesToDisplay(row.approvedOtRangeMins)}</div>
               <div className="space-y-2">
                 {row.approvedInRange.map(a => (
                   <div key={a.date} className="flex items-start justify-between bg-[#FBFAF8] border border-[#F0EEEB] rounded-lg px-3 py-2 text-sm">
@@ -308,6 +347,50 @@ function OtModal({ row, adminName, onClose, onApproved }: {
               </div>
             </div>
           )}
+
+          {/* Shortage days — view only (operations only) */}
+          {row.isOps && (
+            <div>
+              <div className="label mb-2">Shortage days · -{minutesToDisplay(row.shortageRangeMins)}</div>
+              {row.shortageDays.length === 0 ? (
+                <p className="text-sm text-text-secondary py-2">No shortage days in this range.</p>
+              ) : (
+                <div className="space-y-2">
+                  {row.shortageDays.map(day => (
+                    <div key={day.date} className="flex items-start justify-between bg-[#FCF7F7] border border-[#F4E4E4] rounded-lg px-3 py-2 text-sm">
+                      <div>
+                        <div className="font-medium text-text-primary">{fmtDay(day.date)}</div>
+                        <div className="text-xs text-text-secondary font-mono">
+                          Planned {minutesToDisplay(day.plannedMins)} · Worked {minutesToDisplay(day.actualMins)} · {formatTime(day.firstInSecs)} – {formatTime(day.lastOutSecs)}
+                        </div>
+                      </div>
+                      <span className="font-mono text-[#C42B2B] font-semibold whitespace-nowrap">-{minutesToDisplay(day.shortageMins)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Worked days — hours + check-in/out for every fully-worked day */}
+          <div>
+            <div className="label mb-2">Worked days · {row.workedDays.length}</div>
+            {row.workedDays.length === 0 ? (
+              <p className="text-sm text-text-secondary py-2">No check-in/out events in this range.</p>
+            ) : (
+              <div className="space-y-2">
+                {row.workedDays.map(day => (
+                  <div key={day.date} className="flex items-start justify-between bg-[#FBFAF8] border border-[#F0EEEB] rounded-lg px-3 py-2 text-sm">
+                    <div>
+                      <div className="font-medium text-text-primary">{fmtDay(day.date)}</div>
+                      <div className="text-xs text-text-secondary font-mono">{formatTime(day.firstInSecs)} – {formatTime(day.lastOutSecs)}</div>
+                    </div>
+                    <span className="font-mono text-text-primary font-semibold whitespace-nowrap">{minutesToDisplay(day.actualMins)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="p-4 border-t border-border flex justify-end">
@@ -320,9 +403,10 @@ function OtModal({ row, adminName, onClose, onApproved }: {
 
 // ── Page ─────────────────────────────────────────────────────────────────────
 
-export default function EmployeeDashboardPage() {
-  const [preset, setPreset]           = useState<Preset>('1d');
-  const [customDate, setCustomDate]   = useState(todayStr());
+export default function OtShortagePage() {
+  const [preset, setPreset]           = useState<Preset>('30d');
+  const [customStart, setCustomStart] = useState(nDaysAgo(30));
+  const [customEnd, setCustomEnd]     = useState(todayStr());
   const [users, setUsers]             = useState<User[]>([]);
   const [events, setEvents]           = useState<AttendanceRecord[]>([]);
   const [planned, setPlanned]         = useState<PlannedHours[]>([]);
@@ -333,11 +417,11 @@ export default function EmployeeDashboardPage() {
   const [roleFilter, setRoleFilter]   = useState('');
   const [empFilter, setEmpFilter]     = useState('');
   const [adminName, setAdminName]     = useState('Admin');
-  const [otModalUserId, setOtModalUserId] = useState<string | null>(null);
+  const [modalUserId, setModalUserId] = useState<string | null>(null);
 
   const { start, end } = useMemo(
-    () => dateRangeFromPreset(preset, customDate),
-    [preset, customDate],
+    () => dateRangeFromPreset(preset, customStart, customEnd),
+    [preset, customStart, customEnd],
   );
 
   const isSingleDay = start === end;
@@ -378,7 +462,7 @@ export default function EmployeeDashboardPage() {
 
   const holidaySet = useMemo(() => new Set(holidays.map(h => h.date)), [holidays]);
 
-  const rows = useMemo<EmployeeRow[]>(() => {
+  const rows = useMemo<EmpRow[]>(() => {
     return [...users]
       .filter(u => !roleFilter || u.role === roleFilter)
       .filter(u => !empFilter  || u.id   === empFilter)
@@ -389,25 +473,35 @@ export default function EmployeeDashboardPage() {
       .map(u => aggregateForEmployee(u, events, planned, approvals, start, end, holidaySet));
   }, [users, events, planned, approvals, roleFilter, empFilter, start, end, holidaySet]);
 
-  const modalRow = otModalUserId ? rows.find(r => r.user.id === otModalUserId) ?? null : null;
-  const colCount = isSingleDay ? 10 : 9;
+  const modalRow = modalUserId ? rows.find(r => r.user.id === modalUserId) ?? null : null;
+
+  // Range OT/shortage totals — only operations rows contribute.
+  const totals = useMemo(() => rows.reduce((acc, r) => ({
+    pendingOtMins: acc.pendingOtMins + r.pendingOtMins,
+    pendingOtDays: acc.pendingOtDays + r.pendingOt.length,
+    approvedOtMins: acc.approvedOtMins + r.approvedOtRangeMins,
+    shortageMins: acc.shortageMins + r.shortageRangeMins,
+  }), { pendingOtMins: 0, pendingOtDays: 0, approvedOtMins: 0, shortageMins: 0 }), [rows]);
 
   function exportXlsx() {
-    downloadSheet('employee_hours', 'Hours', rows.map(r => ({
+    downloadSheet('ot_shortage', 'OT & Shortage', rows.map(r => ({
       Name: r.user.name,
       'Emp ID': r.user.employeeId ?? '',
       Role: r.user.role,
-      'PL Balance': r.user.plBalance ?? 0,
-      'WO Balance': r.user.woBalance ?? 0,
-      'Working Hrs': r.workingMins !== null ? minutesToDisplay(r.workingMins) : '',
+      'Planned Hrs': r.workingMins !== null ? minutesToDisplay(r.workingMins) : '',
       'Actual Hrs': r.actualMins !== null ? minutesToDisplay(r.actualMins) : '',
-      'Shortage (mins)': r.shortageMins,
-      'Pending OT (mins)': r.pendingOtMins,
-      'Approved OT range (mins)': r.approvedOtRangeMins,
-      'Lifetime Approved OT (mins)': r.user.approvedOtMins ?? 0,
-      'Lifetime Shortage (mins)': r.user.shortageMins ?? 0,
+      'Check-in': isSingleDay && r.firstInSecs ? formatTime(r.firstInSecs) : '',
+      'Check-out': isSingleDay && r.lastOutSecs ? formatTime(r.lastOutSecs) : '',
+      'Shortage (mins)': r.isOps ? r.shortageRangeMins : '',
+      'Pending OT (mins)': r.isOps ? r.pendingOtMins : '',
+      'Pending OT (days)': r.isOps ? r.pendingOt.length : '',
+      'Approved OT range (mins)': r.isOps ? r.approvedOtRangeMins : '',
+      'Lifetime Approved OT (mins)': r.isOps ? (r.user.approvedOtMins ?? 0) : '',
+      'Lifetime Shortage (mins)': r.isOps ? (r.user.shortageMins ?? 0) : '',
     })));
   }
+
+  const TH = 'text-left text-[11px] font-semibold tracking-[0.05em] uppercase text-[#A8A29E] px-[14px] py-3 bg-[#FCFBFA] border-b border-[#F0EEEB]';
 
   return (
     <div className="max-w-[1240px]">
@@ -415,14 +509,37 @@ export default function EmployeeDashboardPage() {
       <div className="mb-6">
         <p className="text-text-secondary text-sm">
           {formatDateRange(start, end)}
-          {!isSingleDay && ` · ${countWorkingDays(start, end, holidaySet)} working days`}
-          {!isSingleDay && holidays.length > 0 && ` · ${holidays.length} holiday${holidays.length > 1 ? 's' : ''}`}
+          {holidays.length > 0 && ` · ${holidays.length} holiday${holidays.length > 1 ? 's' : ''}`}
         </p>
+      </div>
+
+      {/* Summary cards (OT/shortage reflect operations only) */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+        <div className="card !p-4">
+          <div className="text-xs text-text-secondary mb-1">Pending OT · Ops</div>
+          <div className="text-xl font-bold text-[#B26B07]">+{minutesToDisplay(totals.pendingOtMins)}</div>
+          <div className="text-[11px] text-text-secondary mt-0.5">{totals.pendingOtDays} day{totals.pendingOtDays === 1 ? '' : 's'} to review</div>
+        </div>
+        <div className="card !p-4">
+          <div className="text-xs text-text-secondary mb-1">Approved OT · Ops</div>
+          <div className="text-xl font-bold text-[#0A7A50]">+{minutesToDisplay(totals.approvedOtMins)}</div>
+          <div className="text-[11px] text-text-secondary mt-0.5">in this range</div>
+        </div>
+        <div className="card !p-4">
+          <div className="text-xs text-text-secondary mb-1">Shortage · Ops</div>
+          <div className="text-xl font-bold text-[#C42B2B]">-{minutesToDisplay(totals.shortageMins)}</div>
+          <div className="text-[11px] text-text-secondary mt-0.5">automatic, no approval</div>
+        </div>
+        <div className="card !p-4">
+          <div className="text-xs text-text-secondary mb-1">Employees</div>
+          <div className="text-xl font-bold text-text-primary">{rows.length}</div>
+          <div className="text-[11px] text-text-secondary mt-0.5">in view</div>
+        </div>
       </div>
 
       {/* Preset buttons */}
       <div className="card mb-4">
-        <div className="flex flex-wrap gap-2 mb-4">
+        <div className="flex flex-wrap gap-2">
           {PRESETS.map(p => (
             <button
               key={p.key}
@@ -439,15 +556,13 @@ export default function EmployeeDashboardPage() {
         </div>
 
         {preset === 'custom' && (
-          <div className="flex items-center gap-2 pt-3 border-t border-border">
-            <label className="text-sm text-text-secondary whitespace-nowrap">Pick date:</label>
-            <input
-              type="date"
-              value={customDate}
-              max={todayStr()}
-              onChange={e => setCustomDate(e.target.value)}
-              className="input text-sm !py-1.5"
-            />
+          <div className="flex flex-wrap items-center gap-2 pt-3 mt-4 border-t border-border">
+            <label className="text-sm text-text-secondary whitespace-nowrap">From:</label>
+            <input type="date" value={customStart} max={customEnd}
+              onChange={e => setCustomStart(e.target.value)} className="input text-sm !py-1.5 !w-auto" />
+            <label className="text-sm text-text-secondary whitespace-nowrap">To:</label>
+            <input type="date" value={customEnd} max={todayStr()}
+              onChange={e => setCustomEnd(e.target.value)} className="input text-sm !py-1.5 !w-auto" />
           </div>
         )}
       </div>
@@ -487,36 +602,29 @@ export default function EmployeeDashboardPage() {
             <table className="w-full text-sm border-collapse">
               <thead>
                 <tr>
-                  <th className="text-left text-[11px] font-semibold tracking-[0.05em] uppercase text-[#A8A29E] px-[14px] py-3 bg-[#FCFBFA] border-b border-[#F0EEEB] pl-[18px]">Name</th>
-                  <th className="text-left text-[11px] font-semibold tracking-[0.05em] uppercase text-[#A8A29E] px-[14px] py-3 bg-[#FCFBFA] border-b border-[#F0EEEB]">Emp ID</th>
-                  <th className="text-left text-[11px] font-semibold tracking-[0.05em] uppercase text-[#A8A29E] px-[14px] py-3 bg-[#FCFBFA] border-b border-[#F0EEEB]">Role</th>
-                  <th className="text-left text-[11px] font-semibold tracking-[0.05em] uppercase text-[#A8A29E] px-[14px] py-3 bg-[#FCFBFA] border-b border-[#F0EEEB]">PL</th>
-                  <th className="text-left text-[11px] font-semibold tracking-[0.05em] uppercase text-[#A8A29E] px-[14px] py-3 bg-[#FCFBFA] border-b border-[#F0EEEB]">WO</th>
-                  <th className="text-left text-[11px] font-semibold tracking-[0.05em] uppercase text-[#A8A29E] px-[14px] py-3 bg-[#FCFBFA] border-b border-[#F0EEEB]">Working</th>
-                  <th className="text-left text-[11px] font-semibold tracking-[0.05em] uppercase text-[#A8A29E] px-[14px] py-3 bg-[#FCFBFA] border-b border-[#F0EEEB]">Actual</th>
-                  {isSingleDay && <th className="text-left text-[11px] font-semibold tracking-[0.05em] uppercase text-[#A8A29E] px-[14px] py-3 bg-[#FCFBFA] border-b border-[#F0EEEB]">Check-in / Out</th>}
-                  <th className="text-left text-[11px] font-semibold tracking-[0.05em] uppercase text-[#A8A29E] px-[14px] py-3 bg-[#FCFBFA] border-b border-[#F0EEEB]">Shortage</th>
-                  <th className="text-left text-[11px] font-semibold tracking-[0.05em] uppercase text-[#A8A29E] px-[14px] py-3 bg-[#FCFBFA] border-b border-[#F0EEEB] pr-[18px]">Overtime</th>
+                  <th className={`${TH} pl-[18px]`}>Name</th>
+                  <th className={TH}>Emp ID</th>
+                  <th className={TH}>Role</th>
+                  <th className={TH}>Planned</th>
+                  <th className={TH}>Actual</th>
+                  {isSingleDay && <th className={TH}>Check-in / Out</th>}
+                  <th className={TH}>Shortage</th>
+                  <th className={TH}>Overtime</th>
+                  <th className={`${TH} pr-[18px]`}></th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map(r => {
-                  const { user, workingMins, actualMins, shortageMins, pendingOt, pendingOtMins, approvedOtRangeMins, firstInSecs, lastOutSecs } = r;
+                  const { user, isOps, workingMins, actualMins, firstInSecs, lastOutSecs, shortageRangeMins, pendingOt, pendingOtMins, approvedOtRangeMins } = r;
                   return (
-                    <tr key={user.id} className="border-t border-[#F4F2EF] hover:bg-[#FBFAF8] transition-colors">
+                    <tr key={user.id} className="border-t border-[#F4F2EF] hover:bg-[#FBFAF8] transition-colors cursor-pointer" onClick={() => setModalUserId(user.id)}>
                       <td className="px-[14px] py-3 pl-[18px] font-medium text-text-primary whitespace-nowrap">{user.name}</td>
                       <td className="px-[14px] py-3 text-text-secondary text-xs font-mono whitespace-nowrap">{user.employeeId || '—'}</td>
                       <td className="px-[14px] py-3"><RoleBadge role={user.role} /></td>
-                      <td className="px-[14px] py-3">
-                        <span className="bg-[#EDF2FD] text-[#2456C7] px-2 py-0.5 rounded text-xs">{user.plBalance ?? 0}</span>
-                      </td>
-                      <td className="px-[14px] py-3">
-                        <span className="bg-[#EAF7F0] text-[#0A7A50] px-2 py-0.5 rounded text-xs">{user.woBalance ?? 0}</span>
-                      </td>
                       <td className="px-[14px] py-3 text-xs whitespace-nowrap font-mono">
                         {workingMins !== null
                           ? <span className="font-medium text-text-primary">{minutesToDisplay(workingMins)}</span>
-                          : <span className="italic text-text-secondary/60">{user.role === 'operations' ? 'No plan' : '—'}</span>}
+                          : <span className="italic text-text-secondary/60">{isOps ? 'No plan' : '—'}</span>}
                       </td>
                       <td className="px-[14px] py-3 text-xs whitespace-nowrap font-mono">
                         {actualMins !== null ? (
@@ -540,35 +648,38 @@ export default function EmployeeDashboardPage() {
                         </td>
                       )}
                       <td className="px-[14px] py-3 text-xs whitespace-nowrap">
-                        {actualMins === null ? (
+                        {!isOps ? (
+                          <span className="text-text-secondary/50">n/a</span>
+                        ) : actualMins === null ? (
                           <span className="text-text-secondary/60">—</span>
-                        ) : shortageMins > 0 ? (
-                          <span className="bg-[#FBEAEA] text-[#C42B2B] px-2 py-0.5 rounded font-mono">-{minutesToDisplay(shortageMins)}</span>
+                        ) : shortageRangeMins > 0 ? (
+                          <span className="bg-[#FBEAEA] text-[#C42B2B] px-2 py-0.5 rounded font-mono">-{minutesToDisplay(shortageRangeMins)}</span>
                         ) : (
                           <span className="bg-[#EAF7F0] text-[#0A7A50] px-2 py-0.5 rounded">On time</span>
                         )}
                       </td>
-                      <td className="px-[14px] py-3 pr-[18px] text-xs whitespace-nowrap">
-                        {pendingOtMins > 0 ? (
-                          <button onClick={() => setOtModalUserId(user.id)}
-                            className="inline-flex items-center gap-1.5 bg-[#FDF3E4] text-[#B26B07] hover:bg-[#FBEAD0] px-2.5 py-1 rounded-[7px] font-semibold transition-colors">
+                      <td className="px-[14px] py-3 text-xs whitespace-nowrap">
+                        {!isOps ? (
+                          <span className="text-text-secondary/50">n/a</span>
+                        ) : pendingOtMins > 0 ? (
+                          <span className="inline-flex items-center gap-1.5 bg-[#FDF3E4] text-[#B26B07] px-2.5 py-1 rounded-[7px] font-semibold">
                             Review +{minutesToDisplay(pendingOtMins)} · {pendingOt.length}d
-                          </button>
+                          </span>
                         ) : approvedOtRangeMins > 0 ? (
-                          <button onClick={() => setOtModalUserId(user.id)}
-                            className="bg-[#EAF7F0] text-[#0A7A50] px-2 py-0.5 rounded font-mono hover:bg-[#D8F0E4] transition-colors">
-                            +{minutesToDisplay(approvedOtRangeMins)}
-                          </button>
+                          <span className="bg-[#EAF7F0] text-[#0A7A50] px-2 py-0.5 rounded font-mono">+{minutesToDisplay(approvedOtRangeMins)}</span>
                         ) : (
                           <span className="text-text-secondary/60">—</span>
                         )}
+                      </td>
+                      <td className="px-[14px] py-3 pr-[18px] text-right whitespace-nowrap">
+                        <span className="text-xs text-primary font-medium">View →</span>
                       </td>
                     </tr>
                   );
                 })}
                 {rows.length === 0 && (
                   <tr>
-                    <td colSpan={colCount} className="py-10 text-center text-text-secondary text-sm">
+                    <td colSpan={isSingleDay ? 9 : 8} className="py-10 text-center text-text-secondary text-sm">
                       No employees match the current filters.
                     </td>
                   </tr>
@@ -580,10 +691,10 @@ export default function EmployeeDashboardPage() {
       </div>
 
       {modalRow && (
-        <OtModal
+        <DetailModal
           row={modalRow}
           adminName={adminName}
-          onClose={() => setOtModalUserId(null)}
+          onClose={() => setModalUserId(null)}
           onApproved={loadData}
         />
       )}
