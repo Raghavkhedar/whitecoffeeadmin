@@ -340,6 +340,17 @@ export async function setPlannedHours(
   );
 }
 
+// Authorize (or revoke) all-hours OT for an ops employee on a Sunday/holiday. Merges a flag
+// into planned_hours/{date} without requiring a shift window. When true, the OT/shortage
+// ledger counts every worked minute that day as auto-approved OT.
+export async function setOtAuthorization(userId: string, date: string, authorized: boolean): Promise<void> {
+  await setDoc(
+    doc(db, 'users', userId, 'planned_hours', date),
+    { userId, date, otAuthorized: authorized, updatedAt: Timestamp.now() },
+    { merge: true }
+  );
+}
+
 // ── Overtime Approvals ────────────────────────────────────────────────────
 
 export async function getOtApprovalsForDateRange(start: string, end: string): Promise<OtApproval[]> {

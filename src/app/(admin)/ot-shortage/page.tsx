@@ -50,6 +50,10 @@ function fmtDay(s: string): string {
   return new Date(s + 'T12:00:00').toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
 }
 
+function isSunday(date: string): boolean {
+  return new Date(date + 'T12:00:00').getDay() === 0;
+}
+
 // Count Mon–Sat days (no Sundays, no company holidays) in a date range, inclusive.
 function countWorkingDays(start: string, end: string, holidays: Set<string>): number {
   let count = 0;
@@ -116,6 +120,8 @@ interface DayDetail {
   autoOtMins: number;       // pre-authorized OT actually worked = min(surplus, declared) → no review
   pendingExtraMins: number; // surplus beyond declared → needs admin review
   shortageMins: number;     // max(0, planned − actual) — measured vs the plain shift
+  restDayOtMins: number;    // Sunday/holiday: all worked minutes when authorized → auto-approved OT
+  isRestDay: boolean;       // Sunday or company holiday
   firstInSecs: number;
   lastOutSecs: number;
 }
@@ -136,10 +142,14 @@ interface EmpRow {
   approvedInRange: OtApproval[];
   approvedOtRangeMins: number; // approved via ot_approvals docs (the beyond-declared grants)
   shortageDays: DayDetail[];
+  // Rest-day (Sun/holiday) OT — operations only
+  restDayOtRangeMins: number;  // all worked minutes on authorized rest days — auto-approved
+  restDayOtDays: DayDetail[];  // authorized rest days worked in range
+  unauthorizedRestDays: DayDetail[]; // worked a rest day but not authorized (0 OT until authorized)
   // WO (paid no-work day off) — operations only
   woDates: string[];           // dates marked WO in range
   woDebitMins: number;         // woDates.length × WO_DEBIT_MINS
-  netLedgerMins: number;       // (autoOt + approvedOt) − shortage − woDebit; pending OT excluded
+  netLedgerMins: number;       // (autoOt + approvedOt + restDayOt) − shortage − woDebit; pending OT excluded
 }
 
 function aggregateForEmployee(
@@ -157,9 +167,11 @@ function aggregateForEmployee(
 
   // Planned shift + declared-OT minutes per date (ops use admin-set windows)
   const plannedByDate = new Map<string, { planned: number; declared: number; startTime: string; endTime: string }>();
+  const otAuthByDate = new Set<string>(); // dates with admin-authorized rest-day OT
   plannedItems.filter(p => p.userId === user.id).forEach(p => {
     const dur = hhmmToMinutes(p.endTime) - hhmmToMinutes(p.startTime);
     if (dur > 0) plannedByDate.set(p.date, { planned: dur, declared: Math.max(0, p.declaredOtMins ?? 0), startTime: p.startTime, endTime: p.endTime });
+    if (p.otAuthorized) otAuthByDate.add(p.date);
   });
 
   let workingMins: number | null;
@@ -182,9 +194,12 @@ function aggregateForEmployee(
   let hasAnyActual = false;
   let shortageRangeMins = 0;
   let autoOtRangeMins = 0;
+  let restDayOtRangeMins = 0;
   const otDays: DayDetail[] = [];
   const shortageDays: DayDetail[] = [];
   const workedDays: DayDetail[] = [];
+  const restDayOtDays: DayDetail[] = [];
+  const unauthorizedRestDays: DayDetail[] = [];
   let globalFirstIn: number | null = null;
   let globalLastOut: number | null = null;
 
@@ -208,20 +223,30 @@ function aggregateForEmployee(
 
     if (globalLastOut === null || lastOut > globalLastOut) globalLastOut = lastOut;
 
+    const restDay     = isSunday(date) || holidays.has(date);
     const planInfo    = isOps ? plannedByDate.get(date) : { planned: OFFICE_DAY_MINS, declared: 0, startTime: '10:00', endTime: '18:00' };
     const plannedDay  = planInfo?.planned ?? 0;
     const declaredDay = planInfo?.declared ?? 0;
     const detail: DayDetail = {
       date, plannedMins: plannedDay, plannedStart: planInfo?.startTime ?? '', plannedEnd: planInfo?.endTime ?? '',
       declaredOtMins: declaredDay, actualMins: dayMins,
-      autoOtMins: 0, pendingExtraMins: 0, shortageMins: 0, firstInSecs: firstIn, lastOutSecs: lastOut,
+      autoOtMins: 0, pendingExtraMins: 0, shortageMins: 0, restDayOtMins: 0, isRestDay: restDay,
+      firstInSecs: firstIn, lastOutSecs: lastOut,
     };
 
-    // OT / shortage only for operations, and only on days with an expected window.
-    // Holidays carry no window → worked hours still count, but no OT/shortage.
-    // Declared OT is a pre-approval ceiling, NOT an obligation: shortage is measured vs the
-    // plain shift; OT worked up to the declared amount is auto-approved, beyond it needs review.
-    if (isOps && !holidays.has(date) && plannedDay > 0) {
+    if (isOps && restDay) {
+      // Sunday / holiday: every worked minute counts as OT — but ONLY when the admin has
+      // authorized it (prevents self-granting by showing up). Authorization = auto-approval.
+      if (otAuthByDate.has(date)) {
+        detail.restDayOtMins = dayMins;
+        restDayOtRangeMins += dayMins;
+        restDayOtDays.push(detail);
+      } else {
+        unauthorizedRestDays.push(detail);
+      }
+    } else if (isOps && plannedDay > 0) {
+      // Normal working day with a shift. Declared OT is a pre-approval ceiling, NOT an obligation:
+      // shortage is measured vs the plain shift; OT up to declared is auto-approved, beyond needs review.
       const surplus = Math.max(0, dayMins - plannedDay);
       detail.shortageMins     = Math.max(0, plannedDay - dayMins);
       detail.autoOtMins       = Math.min(surplus, declaredDay);
@@ -251,10 +276,10 @@ function aggregateForEmployee(
     : [];
   const woDebitMins = woDates.length * WO_DEBIT_MINS;
 
-  // Net ledger for the range: approved OT (auto + granted) minus shortage minus WO debit.
+  // Net ledger for the range: approved OT (auto + granted + rest-day) minus shortage minus WO debit.
   // Pending OT is excluded (not credited until approved). Informational only — no payroll effect yet.
   const netLedgerMins = isOps
-    ? (autoOtRangeMins + approvedOtRangeMins) - shortageRangeMins - woDebitMins
+    ? (autoOtRangeMins + approvedOtRangeMins + restDayOtRangeMins) - shortageRangeMins - woDebitMins
     : 0;
 
   return {
@@ -272,6 +297,9 @@ function aggregateForEmployee(
     approvedInRange,
     approvedOtRangeMins,
     shortageDays: shortageDays.sort((a, b) => a.date.localeCompare(b.date)),
+    restDayOtRangeMins,
+    restDayOtDays: restDayOtDays.sort((a, b) => a.date.localeCompare(b.date)),
+    unauthorizedRestDays: unauthorizedRestDays.sort((a, b) => a.date.localeCompare(b.date)),
     woDates,
     woDebitMins,
     netLedgerMins,
@@ -362,6 +390,22 @@ function DetailModal({ row, adminName, onClose, onApproved }: {
             </div>
           )}
 
+          {/* Unauthorized rest-day work — worked a Sunday/holiday with no OT authorization */}
+          {row.isOps && row.unauthorizedRestDays.length > 0 && (
+            <div className="bg-[#FFF8EC] border border-[#F4E2BD] rounded-xl px-4 py-3">
+              <div className="text-sm font-semibold text-[#9A5B1E] mb-1">⚠ Rest-day work not authorized · {row.unauthorizedRestDays.length} day{row.unauthorizedRestDays.length === 1 ? '' : 's'}</div>
+              <div className="text-xs text-text-secondary mb-2">Worked a Sunday/holiday but OT isn’t authorized, so it credits 0. Authorize it on the Attendance page for that date to count all hours as OT.</div>
+              <div className="space-y-1.5">
+                {row.unauthorizedRestDays.map(day => (
+                  <div key={`unauth-${day.date}`} className="flex items-center justify-between text-sm">
+                    <span className="font-medium text-text-primary">{fmtDay(day.date)} <span className="text-text-secondary font-normal">({isSunday(day.date) ? 'Sunday' : 'Holiday'})</span></span>
+                    <span className="font-mono text-text-secondary">{formatTime(day.firstInSecs)} – {formatTime(day.lastOutSecs)} · {minutesToDisplay(day.actualMins)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Pending overtime — actionable (operations only) */}
           {row.isOps && (
             <div>
@@ -416,10 +460,10 @@ function DetailModal({ row, adminName, onClose, onApproved }: {
             </div>
           )}
 
-          {/* OT decisions — history (operations only): pre-declared auto, plus admin approve/reject. */}
-          {row.isOps && (row.approvedInRange.length > 0 || row.autoOtRangeMins > 0) && (
+          {/* OT decisions — history (operations only): pre-declared auto, rest-day auto, plus admin approve/reject. */}
+          {row.isOps && (row.approvedInRange.length > 0 || row.autoOtRangeMins > 0 || row.restDayOtRangeMins > 0) && (
             <div>
-              <div className="label mb-2">OT decisions · approved +{minutesToDisplay(row.autoOtRangeMins + row.approvedOtRangeMins)}</div>
+              <div className="label mb-2">OT decisions · approved +{minutesToDisplay(row.autoOtRangeMins + row.approvedOtRangeMins + row.restDayOtRangeMins)}</div>
               {row.autoOtRangeMins > 0 && (
                 <div className="flex items-start justify-between bg-[#EAF7F0] border border-[#D6EFE0] rounded-lg px-3 py-2 text-sm mb-2">
                   <div>
@@ -429,6 +473,15 @@ function DetailModal({ row, adminName, onClose, onApproved }: {
                   <span className="font-mono text-[#0A7A50] font-semibold whitespace-nowrap">+{minutesToDisplay(row.autoOtRangeMins)}</span>
                 </div>
               )}
+              {row.restDayOtDays.map(day => (
+                <div key={`rest-${day.date}`} className="flex items-start justify-between bg-[#EAF7F0] border border-[#D6EFE0] rounded-lg px-3 py-2 text-sm mb-2">
+                  <div>
+                    <div className="font-medium text-text-primary">{fmtDay(day.date)} · rest-day OT</div>
+                    <div className="text-xs text-text-secondary">{isSunday(day.date) ? 'Sunday' : 'Holiday'} work · authorized · {formatTime(day.firstInSecs)} – {formatTime(day.lastOutSecs)}</div>
+                  </div>
+                  <span className="font-mono text-[#0A7A50] font-semibold whitespace-nowrap">+{minutesToDisplay(day.restDayOtMins)}</span>
+                </div>
+              ))}
               <div className="space-y-2">
                 {row.approvedInRange.map(a => {
                   const rejected = a.status === 'rejected';
@@ -602,7 +655,7 @@ export default function OtShortagePage() {
   const totals = useMemo(() => rows.reduce((acc, r) => ({
     pendingOtMins: acc.pendingOtMins + r.pendingOtMins,
     pendingOtDays: acc.pendingOtDays + r.pendingOt.length,
-    approvedOtMins: acc.approvedOtMins + r.approvedOtRangeMins + r.autoOtRangeMins,
+    approvedOtMins: acc.approvedOtMins + r.approvedOtRangeMins + r.autoOtRangeMins + r.restDayOtRangeMins,
     shortageMins: acc.shortageMins + r.shortageRangeMins,
     woDebitMins: acc.woDebitMins + r.woDebitMins,
     woDays: acc.woDays + r.woDates.length,
@@ -622,8 +675,10 @@ export default function OtShortagePage() {
       'Pending OT (mins)': r.isOps ? r.pendingOtMins : '',
       'Pending OT (days)': r.isOps ? r.pendingOt.length : '',
       'Auto-approved OT (mins)': r.isOps ? r.autoOtRangeMins : '',
+      'Rest-day OT (mins)': r.isOps ? r.restDayOtRangeMins : '',
+      'Unauthorized rest days': r.isOps ? r.unauthorizedRestDays.length : '',
       'Granted OT (mins)': r.isOps ? r.approvedOtRangeMins : '',
-      'Total Approved OT (mins)': r.isOps ? (r.autoOtRangeMins + r.approvedOtRangeMins) : '',
+      'Total Approved OT (mins)': r.isOps ? (r.autoOtRangeMins + r.approvedOtRangeMins + r.restDayOtRangeMins) : '',
       'WO days': r.isOps ? r.woDates.length : '',
       'WO debit (mins)': r.isOps ? r.woDebitMins : '',
       'Net ledger (mins)': r.isOps ? r.netLedgerMins : '',
@@ -760,8 +815,8 @@ export default function OtShortagePage() {
               </thead>
               <tbody>
                 {rows.map(r => {
-                  const { user, isOps, workingMins, actualMins, firstInSecs, lastOutSecs, shortageRangeMins, pendingOt, pendingOtMins, approvedOtRangeMins, autoOtRangeMins, woDates, netLedgerMins } = r;
-                  const totalApprovedOt = approvedOtRangeMins + autoOtRangeMins;
+                  const { user, isOps, workingMins, actualMins, firstInSecs, lastOutSecs, shortageRangeMins, pendingOt, pendingOtMins, approvedOtRangeMins, autoOtRangeMins, restDayOtRangeMins, woDates, netLedgerMins } = r;
+                  const totalApprovedOt = approvedOtRangeMins + autoOtRangeMins + restDayOtRangeMins;
                   return (
                     <tr key={user.id} className="border-t border-[#F4F2EF] hover:bg-[#FBFAF8] transition-colors cursor-pointer" onClick={() => setModalUserId(user.id)}>
                       <td className="px-[14px] py-3 pl-[18px] font-medium text-text-primary whitespace-nowrap">{user.name}</td>

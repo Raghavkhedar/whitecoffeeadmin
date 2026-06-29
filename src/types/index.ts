@@ -118,6 +118,7 @@ export interface PlannedHours {
   startTime: string;  // "HH:MM" 24h
   endTime: string;    // "HH:MM" 24h
   declaredOtMins?: number; // admin pre-declared overtime for the day (minutes); worked OT up to this is auto-approved
+  otAuthorized?: boolean;  // Sunday/holiday only: admin authorized this person's rest-day work → all worked minutes count as auto-approved OT
   updatedAt?: Timestamp;
 }
 

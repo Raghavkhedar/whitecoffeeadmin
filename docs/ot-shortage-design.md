@@ -160,8 +160,13 @@ flow**, which is *not yet built* — it should land before (or with) shortage go
    (`getAttendanceStatusForDateRange`), shows a **WO debit** (−480/day) + a **Net** column/card
    (approved OT − shortage − WO; pending OT excluded). **Salary still untouched** — WO's paid
    +1 and the −480 debit land together in step 6 to avoid a half-applied payroll state.
-5. Sunday/holiday authorization + all-hours OT. ← **next**
-6. `settlements/{YYYY-MM}` + month lock + payroll wiring (+ regularization in/out capture).
+5. **Sunday/holiday authorization + all-hours OT — ✅ DONE 2026-06-29.** `otAuthorized` flag on
+   `planned_hours` (`setOtAuthorization`); Attendance page shows an "Authorize OT" toggle in place
+   of the shift inputs on Sundays/holidays. When authorized, every worked minute that rest day is
+   auto-approved OT (authorization = approval, "goes straight into OT"); unauthorized rest-day work
+   credits 0 and is flagged in the OT/Shortage modal. Mirrored in the Employee Dashboard. Net/
+   approved totals + export include rest-day OT. **Salary still untouched.**
+6. `settlements/{YYYY-MM}` + month lock + payroll wiring (+ regularization in/out capture). ← **next**
 7. Manual OT entry + retire lifetime counters.
 
 > Still **portal-only / no payroll effect** so far — the nightly Cloud Function and salary math

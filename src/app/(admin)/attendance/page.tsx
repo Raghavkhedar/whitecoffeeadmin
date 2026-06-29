@@ -1,6 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback, useMemo } from 'react';
-import { getAllUsers, getAttendanceForDate, getAttendanceStatusForMonth, getPlannedHoursForMonth, setPlannedHours, getHolidaysForMonth, setHoliday, deleteHoliday, setAttendanceStatus, deleteAttendanceStatus } from '@/lib/firestore';
+import { getAllUsers, getAttendanceForDate, getAttendanceStatusForMonth, getPlannedHoursForMonth, setPlannedHours, getHolidaysForMonth, setHoliday, deleteHoliday, setAttendanceStatus, deleteAttendanceStatus, setOtAuthorization } from '@/lib/firestore';
 import type { User, AttendanceRecord, AttendanceStatus, PlannedHours, Holiday } from '@/types';
 import { RoleBadge, StatusBadge } from '@/components/ui';
 import ExportButton from '@/components/ExportButton';
@@ -315,6 +315,28 @@ export default function AttendancePage() {
     setSaving(prev => ({ ...prev, [key]: false }));
   }
 
+  // Authorize / revoke all-hours OT for an ops employee on a Sunday or holiday.
+  async function toggleOtAuth(user: User, date: string, authorized: boolean) {
+    const key = `${user.id}__${date}`;
+    setSaving(prev => ({ ...prev, [key]: true }));
+    setSaveError('');
+    try {
+      await setOtAuthorization(user.id, date, authorized);
+      setPlannedByDate(prev => {
+        const next = new Map(prev);
+        const dayMap = new Map(next.get(date) || new Map<string, PlannedHours>());
+        const current = dayMap.get(user.id);
+        dayMap.set(user.id, { ...(current || { id: date, userId: user.id, date, startTime: '', endTime: '' }), otAuthorized: authorized });
+        next.set(date, dayMap);
+        return next;
+      });
+    } catch (err) {
+      setSaveError('Failed to update OT authorization. Please try again.');
+      console.error(err);
+    }
+    setSaving(prev => ({ ...prev, [key]: false }));
+  }
+
   async function saveHoliday() {
     if (!holidayForm || !holidayForm.title.trim()) {
       setHolidayError('A title is required.');
@@ -354,6 +376,8 @@ export default function AttendancePage() {
   const selectedDayMap   = statusByDate.get(selectedDate) || new Map<string, AttendanceStatus>();
   const selectedPlanMap  = plannedByDate.get(selectedDate) || new Map<string, PlannedHours>();
   const selectedHoliday  = holidaysByDate.get(selectedDate);
+  const selectedIsSunday = selectedDate ? new Date(selectedDate + 'T12:00:00').getDay() === 0 : false;
+  const selectedIsRestDay = selectedIsSunday || !!selectedHoliday;
 
   // Merge stored (Cloud Function) statuses with client-side derived statuses for the summary chips.
   // Holidays are skipped like Sundays — no live status is derived for them.
@@ -720,7 +744,21 @@ export default function AttendancePage() {
                         <td className="py-3 pr-4 text-text-secondary text-xs">{user.employeeId || '—'}</td>
                         <td className="py-3 pr-4"><RoleBadge role={user.role} /></td>
                         <td className="py-3 pr-4">
-                          {isOps ? (
+                          {isOps ? (selectedIsRestDay ? (
+                            <label className="flex items-center gap-2 text-xs cursor-pointer" title="Sunday/holiday: authorize this person's work so all hours count as OT">
+                              <input
+                                type="checkbox"
+                                checked={!!planned?.otAuthorized}
+                                onChange={e => toggleOtAuth(user, selectedDate, e.target.checked)}
+                                disabled={isSaving}
+                                className="accent-primary w-4 h-4"
+                              />
+                              <span className={planned?.otAuthorized ? 'text-[#1A5FAF] font-semibold' : 'text-text-secondary'}>
+                                {planned?.otAuthorized ? 'OT authorized (all hours)' : 'Authorize OT'}
+                              </span>
+                              {isSaving && <span className="text-text-secondary">…</span>}
+                            </label>
+                          ) : (
                             <div className="flex items-center gap-1.5">
                               <input
                                 type="time"
@@ -760,7 +798,7 @@ export default function AttendancePage() {
                                 </button>
                               )}
                             </div>
-                          ) : (
+                          )) : (
                             <span className="text-xs text-text-secondary">10:00 – 18:00</span>
                           )}
                         </td>

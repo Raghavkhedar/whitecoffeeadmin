@@ -111,6 +111,7 @@ interface EmployeeRow {
   pendingOt: DayOt[];          // OT days in range not yet approved
   pendingOtMins: number;
   autoOtRangeMins: number;     // pre-authorized (declared) OT worked in range — counts as approved
+  restDayOtRangeMins: number;  // all worked minutes on authorized Sun/holiday rest days — auto-approved
   approvedOtRangeMins: number; // approved OT minutes within the selected range (granted via docs)
   approvedInRange: OtApproval[];
   // Single-day extras
@@ -133,9 +134,11 @@ function aggregateForEmployee(
 
   // Planned shift + declared-OT minutes per date (ops use admin-set windows; office/admin fixed 8h)
   const plannedByDate = new Map<string, { planned: number; declared: number }>();
+  const otAuthByDate = new Set<string>(); // dates with admin-authorized rest-day OT
   plannedItems.filter(p => p.userId === user.id).forEach(p => {
     const dur = hhmmToMinutes(p.endTime) - hhmmToMinutes(p.startTime);
     if (dur > 0) plannedByDate.set(p.date, { planned: dur, declared: Math.max(0, p.declaredOtMins ?? 0) });
+    if (p.otAuthorized) otAuthByDate.add(p.date);
   });
 
   // ── Working minutes (range expected) ───────────────────────────────────
@@ -159,6 +162,7 @@ function aggregateForEmployee(
   let hasAnyActual = false;
   let shortageMins = 0;
   let autoOtRangeMins = 0;
+  let restDayOtRangeMins = 0;
   const otDays: DayOt[] = [];
   let globalFirstIn: number | null = null;
   let globalLastOut: number | null = null;
@@ -183,15 +187,16 @@ function aggregateForEmployee(
 
     if (globalLastOut === null || lastOut > globalLastOut) globalLastOut = lastOut;
 
-    // Planned for this day → derive OT / shortage (absent days never reach here).
-    // Holidays are skipped like Sundays — worked hours still show in Actual, but
-    // the day carries no expected window, so no shortage penalty or OT credit.
-    // Declared OT is a pre-approval ceiling, not an obligation: shortage is vs the plain shift;
-    // OT up to the declared amount is auto-approved, beyond it needs admin review.
+    // Sunday/holiday: all worked minutes count as OT, but only when admin-authorized (auto-approved).
+    // Otherwise (normal working day with a shift): declared OT is a pre-approval ceiling, not an
+    // obligation — shortage is vs the plain shift; OT up to declared is auto-approved, beyond needs review.
+    const restDay     = new Date(date + 'T12:00:00').getDay() === 0 || holidays.has(date);
     const planInfo    = isOps ? plannedByDate.get(date) : { planned: OFFICE_DAY_MINS, declared: 0 };
     const plannedDay  = planInfo?.planned ?? 0;
     const declaredDay = planInfo?.declared ?? 0;
-    if (!holidays.has(date) && plannedDay > 0) {
+    if (isOps && restDay) {
+      if (otAuthByDate.has(date)) restDayOtRangeMins += dayMins;
+    } else if (plannedDay > 0) {
       const surplus          = Math.max(0, dayMins - plannedDay);
       const autoOt           = Math.min(surplus, declaredDay);
       const pendingExtra      = Math.max(0, surplus - declaredDay);
@@ -220,6 +225,7 @@ function aggregateForEmployee(
     pendingOt,
     pendingOtMins,
     autoOtRangeMins,
+    restDayOtRangeMins,
     approvedOtRangeMins,
     approvedInRange,
     firstInSecs: isSingleDay ? globalFirstIn : null,
@@ -451,8 +457,9 @@ export default function EmployeeDashboardPage() {
       'Shortage (mins)': r.shortageMins,
       'Pending OT (mins)': r.pendingOtMins,
       'Auto-approved OT (mins)': r.autoOtRangeMins,
+      'Rest-day OT (mins)': r.restDayOtRangeMins,
       'Granted OT (mins)': r.approvedOtRangeMins,
-      'Total Approved OT (mins)': r.autoOtRangeMins + r.approvedOtRangeMins,
+      'Total Approved OT (mins)': r.autoOtRangeMins + r.restDayOtRangeMins + r.approvedOtRangeMins,
       'Lifetime Approved OT (mins)': r.user.approvedOtMins ?? 0,
       'Lifetime Shortage (mins)': r.user.shortageMins ?? 0,
     })));
@@ -550,8 +557,8 @@ export default function EmployeeDashboardPage() {
               </thead>
               <tbody>
                 {rows.map(r => {
-                  const { user, workingMins, actualMins, shortageMins, pendingOt, pendingOtMins, approvedOtRangeMins, autoOtRangeMins, firstInSecs, lastOutSecs } = r;
-                  const totalApprovedOt = approvedOtRangeMins + autoOtRangeMins;
+                  const { user, workingMins, actualMins, shortageMins, pendingOt, pendingOtMins, approvedOtRangeMins, autoOtRangeMins, restDayOtRangeMins, firstInSecs, lastOutSecs } = r;
+                  const totalApprovedOt = approvedOtRangeMins + autoOtRangeMins + restDayOtRangeMins;
                   return (
                     <tr key={user.id} className="border-t border-[#F4F2EF] hover:bg-[#FBFAF8] transition-colors">
                       <td className="px-[14px] py-3 pl-[18px] font-medium text-text-primary whitespace-nowrap">{user.name}</td>
