@@ -273,6 +273,21 @@ export async function setAttendanceStatus(
   );
 }
 
+// Remove an admin-set status doc (e.g. clearing a WO) so the nightly function can recompute.
+export async function deleteAttendanceStatus(userId: string, date: string): Promise<void> {
+  await deleteDoc(doc(db, 'users', userId, 'attendance_status', date));
+}
+
+export async function getAttendanceStatusForDateRange(start: string, end: string): Promise<AttendanceStatus[]> {
+  const q = query(
+    collectionGroup(db, 'attendance_status'),
+    where('date', '>=', start),
+    where('date', '<=', end)
+  );
+  const snap = await getDocs(q);
+  return snap.docs.map(d => ({ id: d.id, ...d.data() } as AttendanceStatus));
+}
+
 // ── Planned Hours (operations shift windows) ──────────────────────────────
 
 // month is 1-indexed (1 = January)

@@ -3,8 +3,8 @@ import { useEffect, useState, useMemo, useCallback } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import { doc, getDoc } from 'firebase/firestore';
 import { auth, db } from '@/lib/firebase';
-import { getAllUsers, getAttendanceForDateRange, getPlannedHoursForDateRange, getOtApprovalsForDateRange, getHolidaysForDateRange, approveOt } from '@/lib/firestore';
-import type { User, AttendanceRecord, PlannedHours, OtApproval, Holiday } from '@/types';
+import { getAllUsers, getAttendanceForDateRange, getPlannedHoursForDateRange, getOtApprovalsForDateRange, getHolidaysForDateRange, getAttendanceStatusForDateRange, approveOt } from '@/lib/firestore';
+import type { User, AttendanceRecord, PlannedHours, OtApproval, Holiday, AttendanceStatus } from '@/types';
 import { RoleBadge } from '@/components/ui';
 import ExportButton from '@/components/ExportButton';
 import { downloadSheet } from '@/lib/excel';
@@ -88,6 +88,7 @@ function formatTime(secs: number): string {
 }
 
 const OFFICE_DAY_MINS = 8 * 60;
+const WO_DEBIT_MINS = 8 * 60; // a WO (paid no-work day off) owes a standard 8h, payable by OT
 
 // Field-work event types for operations (home events excluded — commute bookends)
 const OPS_IN_TYPES  = new Set(['site_in', 'market_in']);
@@ -123,6 +124,10 @@ interface EmpRow {
   approvedInRange: OtApproval[];
   approvedOtRangeMins: number; // approved via ot_approvals docs (the beyond-declared grants)
   shortageDays: DayDetail[];
+  // WO (paid no-work day off) — operations only
+  woDates: string[];           // dates marked WO in range
+  woDebitMins: number;         // woDates.length × WO_DEBIT_MINS
+  netLedgerMins: number;       // (autoOt + approvedOt) − shortage − woDebit; pending OT excluded
 }
 
 function aggregateForEmployee(
@@ -130,6 +135,7 @@ function aggregateForEmployee(
   allEvents: AttendanceRecord[],
   plannedItems: PlannedHours[],
   approvals: OtApproval[],
+  statuses: AttendanceStatus[],
   start: string,
   end: string,
   holidays: Set<string>,
@@ -226,6 +232,18 @@ function aggregateForEmployee(
   const approvedInRange = Array.from(approvedByDate.values()).sort((a, b) => a.date.localeCompare(b.date));
   const approvedOtRangeMins = approvedInRange.reduce((s, a) => s + (a.approvedMins || 0), 0);
 
+  // WO debit (ops only): each WO-marked day owes a standard 8h, payable by OT this month.
+  const woDates = isOps
+    ? statuses.filter(s => s.userId === user.id && s.status === 'WO').map(s => s.date).sort()
+    : [];
+  const woDebitMins = woDates.length * WO_DEBIT_MINS;
+
+  // Net ledger for the range: approved OT (auto + granted) minus shortage minus WO debit.
+  // Pending OT is excluded (not credited until approved). Informational only — no payroll effect yet.
+  const netLedgerMins = isOps
+    ? (autoOtRangeMins + approvedOtRangeMins) - shortageRangeMins - woDebitMins
+    : 0;
+
   return {
     user,
     isOps,
@@ -241,6 +259,9 @@ function aggregateForEmployee(
     approvedInRange,
     approvedOtRangeMins,
     shortageDays: shortageDays.sort((a, b) => a.date.localeCompare(b.date)),
+    woDates,
+    woDebitMins,
+    netLedgerMins,
   };
 }
 
@@ -303,6 +324,16 @@ function DetailModal({ row, adminName, onClose, onApproved }: {
 
         <div className="overflow-y-auto p-5 space-y-5">
           {error && <p className="text-sm text-red-600 bg-red-50 rounded-lg p-3">{error}</p>}
+
+          {/* Net ledger for the range (operations only) — informational, no payroll effect yet */}
+          {row.isOps && (
+            <div className="flex items-center justify-between bg-[#FBFAF8] border border-[#F0EEEB] rounded-xl px-4 py-3">
+              <div className="text-sm text-text-secondary">Net ledger (range) · approved OT − shortage − WO</div>
+              <div className={`text-lg font-bold font-mono ${row.netLedgerMins < 0 ? 'text-[#C42B2B]' : 'text-[#0A7A50]'}`}>
+                {row.netLedgerMins < 0 ? '-' : '+'}{minutesToDisplay(row.netLedgerMins)}
+              </div>
+            </div>
+          )}
 
           {/* Pending overtime — actionable (operations only) */}
           {row.isOps && (
@@ -399,6 +430,24 @@ function DetailModal({ row, adminName, onClose, onApproved }: {
             </div>
           )}
 
+          {/* WO days — paid no-work days off, each owes 8h payable by OT (operations only) */}
+          {row.isOps && row.woDates.length > 0 && (
+            <div>
+              <div className="label mb-2">WO days · -{minutesToDisplay(row.woDebitMins)} ({row.woDates.length} × 8h)</div>
+              <div className="space-y-2">
+                {row.woDates.map(date => (
+                  <div key={date} className="flex items-start justify-between bg-[#F2F7FC] border border-[#DCE9F6] rounded-lg px-3 py-2 text-sm">
+                    <div>
+                      <div className="font-medium text-text-primary">{fmtDay(date)}</div>
+                      <div className="text-xs text-text-secondary">Paid no-work day off — owes 8h, payable by OT this month</div>
+                    </div>
+                    <span className="font-mono text-[#1A5FAF] font-semibold whitespace-nowrap">-{minutesToDisplay(WO_DEBIT_MINS)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Worked days — hours + check-in/out for every fully-worked day */}
           <div>
             <div className="label mb-2">Worked days · {row.workedDays.length}</div>
@@ -439,6 +488,7 @@ export default function OtShortagePage() {
   const [planned, setPlanned]         = useState<PlannedHours[]>([]);
   const [approvals, setApprovals]     = useState<OtApproval[]>([]);
   const [holidays, setHolidays]       = useState<Holiday[]>([]);
+  const [statuses, setStatuses]       = useState<AttendanceStatus[]>([]);
   const [loading, setLoading]         = useState(true);
   const [error, setError]             = useState('');
   const [roleFilter, setRoleFilter]   = useState('');
@@ -467,18 +517,20 @@ export default function OtShortagePage() {
     setLoading(true);
     setError('');
     try {
-      const [fetchedUsers, fetchedEvents, fetchedPlanned, fetchedApprovals, fetchedHolidays] = await Promise.all([
+      const [fetchedUsers, fetchedEvents, fetchedPlanned, fetchedApprovals, fetchedHolidays, fetchedStatuses] = await Promise.all([
         getAllUsers(),
         getAttendanceForDateRange(start, end),
         getPlannedHoursForDateRange(start, end),
         getOtApprovalsForDateRange(start, end),
         getHolidaysForDateRange(start, end),
+        getAttendanceStatusForDateRange(start, end),
       ]);
       setUsers(fetchedUsers);
       setEvents(fetchedEvents);
       setPlanned(fetchedPlanned);
       setApprovals(fetchedApprovals);
       setHolidays(fetchedHolidays);
+      setStatuses(fetchedStatuses);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -497,8 +549,8 @@ export default function OtShortagePage() {
         const order: Record<string, number> = { office: 0, admin: 1, operations: 2 };
         return (order[a.role] ?? 3) - (order[b.role] ?? 3) || a.name.localeCompare(b.name);
       })
-      .map(u => aggregateForEmployee(u, events, planned, approvals, start, end, holidaySet));
-  }, [users, events, planned, approvals, roleFilter, empFilter, start, end, holidaySet]);
+      .map(u => aggregateForEmployee(u, events, planned, approvals, statuses, start, end, holidaySet));
+  }, [users, events, planned, approvals, statuses, roleFilter, empFilter, start, end, holidaySet]);
 
   const modalRow = modalUserId ? rows.find(r => r.user.id === modalUserId) ?? null : null;
 
@@ -508,7 +560,10 @@ export default function OtShortagePage() {
     pendingOtDays: acc.pendingOtDays + r.pendingOt.length,
     approvedOtMins: acc.approvedOtMins + r.approvedOtRangeMins + r.autoOtRangeMins,
     shortageMins: acc.shortageMins + r.shortageRangeMins,
-  }), { pendingOtMins: 0, pendingOtDays: 0, approvedOtMins: 0, shortageMins: 0 }), [rows]);
+    woDebitMins: acc.woDebitMins + r.woDebitMins,
+    woDays: acc.woDays + r.woDates.length,
+    netLedgerMins: acc.netLedgerMins + r.netLedgerMins,
+  }), { pendingOtMins: 0, pendingOtDays: 0, approvedOtMins: 0, shortageMins: 0, woDebitMins: 0, woDays: 0, netLedgerMins: 0 }), [rows]);
 
   function exportXlsx() {
     downloadSheet('ot_shortage', 'OT & Shortage', rows.map(r => ({
@@ -525,6 +580,9 @@ export default function OtShortagePage() {
       'Auto-approved OT (mins)': r.isOps ? r.autoOtRangeMins : '',
       'Granted OT (mins)': r.isOps ? r.approvedOtRangeMins : '',
       'Total Approved OT (mins)': r.isOps ? (r.autoOtRangeMins + r.approvedOtRangeMins) : '',
+      'WO days': r.isOps ? r.woDates.length : '',
+      'WO debit (mins)': r.isOps ? r.woDebitMins : '',
+      'Net ledger (mins)': r.isOps ? r.netLedgerMins : '',
       'Lifetime Approved OT (mins)': r.isOps ? (r.user.approvedOtMins ?? 0) : '',
       'Lifetime Shortage (mins)': r.isOps ? (r.user.shortageMins ?? 0) : '',
     })));
@@ -542,8 +600,8 @@ export default function OtShortagePage() {
         </p>
       </div>
 
-      {/* Summary cards (OT/shortage reflect operations only) */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+      {/* Summary cards (OT/shortage/WO reflect operations only) */}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
         <div className="card !p-4">
           <div className="text-xs text-text-secondary mb-1">Pending OT · Ops</div>
           <div className="text-xl font-bold text-[#B26B07]">+{minutesToDisplay(totals.pendingOtMins)}</div>
@@ -558,6 +616,18 @@ export default function OtShortagePage() {
           <div className="text-xs text-text-secondary mb-1">Shortage · Ops</div>
           <div className="text-xl font-bold text-[#C42B2B]">-{minutesToDisplay(totals.shortageMins)}</div>
           <div className="text-[11px] text-text-secondary mt-0.5">automatic, no approval</div>
+        </div>
+        <div className="card !p-4">
+          <div className="text-xs text-text-secondary mb-1">WO debit · Ops</div>
+          <div className="text-xl font-bold text-[#1A5FAF]">-{minutesToDisplay(totals.woDebitMins)}</div>
+          <div className="text-[11px] text-text-secondary mt-0.5">{totals.woDays} WO day{totals.woDays === 1 ? '' : 's'} × 8h</div>
+        </div>
+        <div className="card !p-4">
+          <div className="text-xs text-text-secondary mb-1">Net · Ops</div>
+          <div className={`text-xl font-bold ${totals.netLedgerMins < 0 ? 'text-[#C42B2B]' : 'text-[#0A7A50]'}`}>
+            {totals.netLedgerMins < 0 ? '-' : '+'}{minutesToDisplay(totals.netLedgerMins)}
+          </div>
+          <div className="text-[11px] text-text-secondary mt-0.5">OT − shortage − WO</div>
         </div>
         <div className="card !p-4">
           <div className="text-xs text-text-secondary mb-1">Employees</div>
@@ -639,12 +709,14 @@ export default function OtShortagePage() {
                   {isSingleDay && <th className={TH}>Check-in / Out</th>}
                   <th className={TH}>Shortage</th>
                   <th className={TH}>Overtime</th>
+                  <th className={TH}>WO</th>
+                  <th className={TH}>Net</th>
                   <th className={`${TH} pr-[18px]`}></th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map(r => {
-                  const { user, isOps, workingMins, actualMins, firstInSecs, lastOutSecs, shortageRangeMins, pendingOt, pendingOtMins, approvedOtRangeMins, autoOtRangeMins } = r;
+                  const { user, isOps, workingMins, actualMins, firstInSecs, lastOutSecs, shortageRangeMins, pendingOt, pendingOtMins, approvedOtRangeMins, autoOtRangeMins, woDates, netLedgerMins } = r;
                   const totalApprovedOt = approvedOtRangeMins + autoOtRangeMins;
                   return (
                     <tr key={user.id} className="border-t border-[#F4F2EF] hover:bg-[#FBFAF8] transition-colors cursor-pointer" onClick={() => setModalUserId(user.id)}>
@@ -701,6 +773,24 @@ export default function OtShortagePage() {
                           <span className="text-text-secondary/60">—</span>
                         )}
                       </td>
+                      <td className="px-[14px] py-3 text-xs whitespace-nowrap">
+                        {!isOps ? (
+                          <span className="text-text-secondary/50">n/a</span>
+                        ) : woDates.length > 0 ? (
+                          <span className="bg-[#E7F0FA] text-[#1A5FAF] px-2 py-0.5 rounded font-mono">-{minutesToDisplay(woDates.length * 480)} · {woDates.length}d</span>
+                        ) : (
+                          <span className="text-text-secondary/60">—</span>
+                        )}
+                      </td>
+                      <td className="px-[14px] py-3 text-xs whitespace-nowrap">
+                        {!isOps ? (
+                          <span className="text-text-secondary/50">n/a</span>
+                        ) : (
+                          <span className={`px-2 py-0.5 rounded font-mono font-semibold ${netLedgerMins < 0 ? 'bg-[#FBEAEA] text-[#C42B2B]' : netLedgerMins > 0 ? 'bg-[#EAF7F0] text-[#0A7A50]' : 'text-text-secondary/60'}`}>
+                            {netLedgerMins < 0 ? '-' : '+'}{minutesToDisplay(netLedgerMins)}
+                          </span>
+                        )}
+                      </td>
                       <td className="px-[14px] py-3 pr-[18px] text-right whitespace-nowrap">
                         <span className="text-xs text-primary font-medium">View →</span>
                       </td>
@@ -709,7 +799,7 @@ export default function OtShortagePage() {
                 })}
                 {rows.length === 0 && (
                   <tr>
-                    <td colSpan={isSingleDay ? 9 : 8} className="py-10 text-center text-text-secondary text-sm">
+                    <td colSpan={isSingleDay ? 11 : 10} className="py-10 text-center text-text-secondary text-sm">
                       No employees match the current filters.
                     </td>
                   </tr>

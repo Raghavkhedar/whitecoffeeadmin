@@ -152,8 +152,15 @@ flow**, which is *not yet built* — it should land before (or with) shortage go
    field next to each ops shift). Both the OT/Shortage page and the Employee Dashboard now apply:
    declared OT auto-approved (no review), surplus beyond it flagged pending, shortage measured
    vs the plain shift. (Both pages mirror the logic — de-dup into a shared module is pending.)
-4. Paid WO status + ledger debit. ← **next**
-5. Sunday/holiday authorization + all-hours OT.
+4. **Paid WO status + ledger debit — ✅ DONE 2026-06-29.** `WO` added as a status
+   (`AttendanceStatus` union, `StatusBadge`, regularization options, attendance MTD chips).
+   Admin marks/clears WO inline on the Attendance page (`markWo`/`clearWo` →
+   `setAttendanceStatus`/`deleteAttendanceStatus`, `markedBy:'admin'`) AND can approve a
+   regularization to WO. OT/Shortage page reads `attendance_status` for the range
+   (`getAttendanceStatusForDateRange`), shows a **WO debit** (−480/day) + a **Net** column/card
+   (approved OT − shortage − WO; pending OT excluded). **Salary still untouched** — WO's paid
+   +1 and the −480 debit land together in step 6 to avoid a half-applied payroll state.
+5. Sunday/holiday authorization + all-hours OT. ← **next**
 6. `settlements/{YYYY-MM}` + month lock + payroll wiring (+ regularization in/out capture).
 7. Manual OT entry + retire lifetime counters.
 

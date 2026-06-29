@@ -10,7 +10,7 @@ import { downloadSheet } from '@/lib/excel';
 
 type Filter = 'pending' | 'approved' | 'rejected' | 'all';
 
-const ATTENDANCE_STATUSES = ['Present', 'HalfDay', 'Absent', 'PL', 'LWP'] as const;
+const ATTENDANCE_STATUSES = ['Present', 'HalfDay', 'Absent', 'PL', 'LWP', 'WO'] as const;
 
 function StatusBadge({ status }: { status: string }) {
   const cls = status === 'approved' ? 'badge-approved' : status === 'rejected' ? 'badge-rejected' : 'badge-pending';
@@ -29,6 +29,7 @@ function ApprovedStatusBadge({ status }: { status: string }) {
     Absent:   'bg-red-100 text-red-700',
     PL:       'bg-blue-100 text-blue-700',
     LWP:      'bg-purple-100 text-purple-700',
+    WO:       'bg-sky-100 text-sky-700',
   };
   const cls = colors[status] ?? 'bg-gray-100 text-gray-600';
   return <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${cls}`}>→ {status}</span>;

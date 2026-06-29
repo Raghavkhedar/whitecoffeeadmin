@@ -40,7 +40,7 @@ export interface AttendanceStatus {
   userName: string;
   employeeId: string;
   role: string;
-  status: 'Present' | 'HalfDay' | 'SL' | 'SLNF' | 'Absent' | 'PL' | 'LWP';
+  status: 'Present' | 'HalfDay' | 'SL' | 'SLNF' | 'Absent' | 'PL' | 'LWP' | 'WO';
   markedBy: 'auto' | 'admin';
   updatedAt?: Timestamp;
 }

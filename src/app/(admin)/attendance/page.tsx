@@ -1,6 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback, useMemo } from 'react';
-import { getAllUsers, getAttendanceForDate, getAttendanceStatusForMonth, getPlannedHoursForMonth, setPlannedHours, getHolidaysForMonth, setHoliday, deleteHoliday } from '@/lib/firestore';
+import { getAllUsers, getAttendanceForDate, getAttendanceStatusForMonth, getPlannedHoursForMonth, setPlannedHours, getHolidaysForMonth, setHoliday, deleteHoliday, setAttendanceStatus, deleteAttendanceStatus } from '@/lib/firestore';
 import type { User, AttendanceRecord, AttendanceStatus, PlannedHours, Holiday } from '@/types';
 import { RoleBadge, StatusBadge } from '@/components/ui';
 import ExportButton from '@/components/ExportButton';
@@ -270,6 +270,51 @@ export default function AttendancePage() {
     setSaving(prev => ({ ...prev, [key]: false }));
   }
 
+  // Mark / clear a paid WO (no-work day off) for an ops employee. Writes a markedBy:'admin'
+  // status doc the nightly function won't overwrite; clearing removes it so it recomputes.
+  async function markWo(user: User, date: string) {
+    const key = `${user.id}__${date}`;
+    setSaving(prev => ({ ...prev, [key]: true }));
+    setSaveError('');
+    try {
+      await setAttendanceStatus(user.id, date, {
+        date, userId: user.id, userName: user.name || '', employeeId: user.employeeId || '',
+        role: user.role || '', status: 'WO', markedBy: 'admin',
+      });
+      setStatusByDate(prev => {
+        const next = new Map(prev);
+        const dayMap = new Map(next.get(date) || new Map<string, AttendanceStatus>());
+        dayMap.set(user.id, { id: date, date, userId: user.id, userName: user.name || '', employeeId: user.employeeId || '', role: user.role || '', status: 'WO', markedBy: 'admin' });
+        next.set(date, dayMap);
+        return next;
+      });
+    } catch (err) {
+      setSaveError('Failed to mark WO. Please try again.');
+      console.error(err);
+    }
+    setSaving(prev => ({ ...prev, [key]: false }));
+  }
+
+  async function clearWo(userId: string, date: string) {
+    const key = `${userId}__${date}`;
+    setSaving(prev => ({ ...prev, [key]: true }));
+    setSaveError('');
+    try {
+      await deleteAttendanceStatus(userId, date);
+      setStatusByDate(prev => {
+        const next = new Map(prev);
+        const dayMap = new Map(next.get(date) || new Map<string, AttendanceStatus>());
+        dayMap.delete(userId);
+        next.set(date, dayMap);
+        return next;
+      });
+    } catch (err) {
+      setSaveError('Failed to clear WO. Please try again.');
+      console.error(err);
+    }
+    setSaving(prev => ({ ...prev, [key]: false }));
+  }
+
   async function saveHoliday() {
     if (!holidayForm || !holidayForm.title.trim()) {
       setHolidayError('A title is required.');
@@ -338,6 +383,7 @@ export default function AttendancePage() {
   const totalSLNF    = statusValues.filter(s => s === 'SLNF').length;
   const totalAbsent  = statusValues.filter(s => s === 'Absent').length;
   const totalLeave   = statusValues.filter(s => s === 'PL' || s === 'LWP').length;
+  const totalWo      = statusValues.filter(s => s === 'WO').length;
 
   const selectedDateDisplay = new Date(selectedDate + 'T00:00:00').toLocaleDateString('en-IN', {
     weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
@@ -526,6 +572,7 @@ export default function AttendancePage() {
               { count: totalSLNF,    label: 'Log Not Found', cls: 'bg-gray-50 text-gray-700 border border-gray-200' },
               { count: totalAbsent,  label: 'Absent',        cls: 'bg-red-50 text-red-700 border border-red-200' },
               { count: totalLeave,   label: 'On Leave',      cls: 'bg-blue-50 text-blue-700 border border-blue-200' },
+              { count: totalWo,      label: 'WO',            cls: 'bg-sky-50 text-sky-700 border border-sky-200' },
             ].map(({ count, label, cls }) => (
               <span key={label} className={`text-xs px-2.5 py-1 rounded-lg font-medium ${cls}`}>
                 {count} {label}
@@ -718,18 +765,28 @@ export default function AttendancePage() {
                           )}
                         </td>
                         <td className="py-3 pr-4">
-                          {displayStatus ? (
-                            <div className="flex items-center gap-1.5">
-                              <StatusBadge status={displayStatus} />
-                              {!status && derivedStatus && (
-                                <span className="text-[10px] text-text-secondary italic">live</span>
-                              )}
-                            </div>
-                          ) : isOps && !hasPlan ? (
-                            <span className="text-xs text-text-secondary italic">Set plan</span>
-                          ) : (
-                            <span className="text-xs text-text-secondary italic">No data</span>
-                          )}
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            {displayStatus ? (
+                              <>
+                                <StatusBadge status={displayStatus} />
+                                {!status && derivedStatus && (
+                                  <span className="text-[10px] text-text-secondary italic">live</span>
+                                )}
+                              </>
+                            ) : isOps && !hasPlan ? (
+                              <span className="text-xs text-text-secondary italic">Set plan</span>
+                            ) : (
+                              <span className="text-xs text-text-secondary italic">No data</span>
+                            )}
+                            {isOps && (status === 'WO' ? (
+                              <button onClick={() => clearWo(user.id, selectedDate)} disabled={isSaving}
+                                className="text-[11px] text-text-secondary underline hover:text-primary disabled:opacity-50">clear</button>
+                            ) : (
+                              <button onClick={() => markWo(user, selectedDate)} disabled={isSaving}
+                                title="Mark a paid no-work day off (owes 8h, payable by OT this month)"
+                                className="text-[11px] text-[#1A5FAF] border border-[#CFE0F3] bg-[#F2F7FC] rounded px-1.5 py-0.5 hover:bg-[#E7F0FA] disabled:opacity-50">Mark WO</button>
+                            ))}
+                          </div>
                         </td>
                         <td className="py-3 pr-4 text-text-secondary text-xs">
                           {eventsLoading ? '…' : <VisitCell visit={firstVisit} />}

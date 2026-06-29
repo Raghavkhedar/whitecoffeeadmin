@@ -28,7 +28,7 @@ No test framework configured.
 - `sites/` — geofenced locations with GPS coordinates
 - `users/{uid}/leave_requests/`
 - `users/{uid}/attendance/` — check-in/out events. Ops `site_in`/`site_out` carry free-text `siteName`; `siteId` is filled later by admin via **Site IDs** page (`updateAttendanceSiteId`).
-- `users/{uid}/attendance_status/{date}` — computed daily status (written by `computeDailyAttendanceStatus`)
+- `users/{uid}/attendance_status/{date}` — computed daily status (written by `computeDailyAttendanceStatus`). Statuses: `Present`/`HalfDay`/`SL`/`SLNF`/`Absent`/`PL`/`LWP`/`WO`. **WO** (paid no-work day off for ops) is admin-set (`markedBy:'admin'`) via the Attendance page (Mark WO / clear) or as a regularization outcome; in the OT/shortage ledger it owes a standard 8h, payable by OT in the same month (not yet wired into salary — see redesign spec)
 - `users/{uid}/planned_hours/{date}` — admin-set shift window for ops (`startTime`/`endTime` as `"HH:MM"`); office fixed 10–18. Optional `declaredOtMins` = admin pre-declared overtime for that day (OT worked up to this is auto-approved; set inline on the Attendance page next to the shift)
 - `users/{uid}/daily_hours/{date}` — per-day `plannedMins`/`actualMins`/`shortageMins`/`otMins` (written by `computeDailyAttendanceStatus`, fully-worked days only)
 - `users/{uid}/ot_approvals/{date}` — admin-approved overtime: `requestedMins`/`approvedMins`/`reason`/`approvedBy` (written by `approveOt` from the employee dashboard)

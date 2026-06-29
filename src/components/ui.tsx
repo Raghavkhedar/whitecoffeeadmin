@@ -42,6 +42,7 @@ const STATUS_MAP: Record<string, { label: string; bg: string; color: string }> =
   PL:        { label: 'Paid Leave',    bg: '#EDF2FD', color: '#2456C7' },
   LWP:       { label: 'LWP',           bg: '#F2EFEC', color: '#6B5E54' },
   Absent:    { label: 'Absent',        bg: '#FBEAEA', color: '#C42B2B' },
+  WO:        { label: 'WO',            bg: '#E7F0FA', color: '#1A5FAF' },
 };
 
 export function StatusBadge({ status }: { status: string }) {
