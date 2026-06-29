@@ -166,8 +166,15 @@ flow**, which is *not yet built* — it should land before (or with) shortage go
    auto-approved OT (authorization = approval, "goes straight into OT"); unauthorized rest-day work
    credits 0 and is flagged in the OT/Shortage modal. Mirrored in the Employee Dashboard. Net/
    approved totals + export include rest-day OT. **Salary still untouched.**
-6. `settlements/{YYYY-MM}` + month lock + payroll wiring (+ regularization in/out capture). ← **next**
-7. Manual OT entry + retire lifetime counters.
+6. **`settlements/{YYYY-MM}` + month lock + payroll wiring — ✅ DONE 2026-06-30.** New
+   **Settlements** page (manual Settle & Lock per month, clean-state gate); `Settlement` type +
+   `settleMonth`/`getSettlementsForMonth`/`unlockMonthSettlement`; shared `computeRangeLedger` +
+   `settlementCash` (`src/lib/otAggregate.ts`, tested). Cloud Function (`exportToSheets`) reads each
+   user's **previous-month locked** settlement and adds `settlementCash` to TOTAL DUE (new column;
+   OT paid in arrears). **Requires `firebase deploy --only functions` to take effect.**
+   Still TODO from this step: regularization in/out capture (so a regularized-to-Present day can
+   carry shortage/OT) — deferred to step 7.
+7. Manual OT entry + retire lifetime counters (+ regularization in/out capture). ← **next**
 
 > Still **portal-only / no payroll effect** so far — the nightly Cloud Function and salary math
 > are untouched. The ledger/settlement wiring (steps 4–7) is where pay is affected.

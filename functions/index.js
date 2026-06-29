@@ -702,12 +702,25 @@ exports.exportToSheets = onSchedule(
         // Tab doesn't exist yet — start fresh
       }
 
+      // Prior-month settlement (OT/shortage/WO) — paid in arrears. Read each user's LOCKED
+      // settlement for the previous month and add its cash to this month's TOTAL DUE.
+      const prevMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const prevMonth = `${prevMonthDate.getFullYear()}-${String(prevMonthDate.getMonth() + 1).padStart(2, "0")}`;
+      const settlementCashMap = new Map(); // userId → settlement cash (locked only)
+      await Promise.all(allUsersData.map(async (u) => {
+        try {
+          const sdoc = await db.collection("users").doc(u.id).collection("settlements").doc(prevMonth).get();
+          const s = sdoc.data();
+          if (s && s.locked) settlementCashMap.set(u.id, Number(s.settlementCash) || 0);
+        } catch (_) { /* no settlement for this user — skip */ }
+      }));
+
       const header = [
         "Date", "EMP Name", "EMP ID", "Days Passed in Month",
         "Present (×1)", "SL (×0.75)", "Half Day (×0.5)", "SLNF (×0.5)", "PL (×1)", "LWP (×0)", "Absent (×-2)",
         "Leaves", "Days NP",
         "Salary Rate", "Salary Due MTD",
-        "Covy Due (approx avg)", "Imprest Due MTD", "TOTAL DUE",
+        "Covy Due (approx avg)", "Imprest Due MTD", `Prior Settlement ${prevMonth} (₹)`, "TOTAL DUE",
       ];
 
       const sortedUsers = [...allUsersData].sort((a, b) => {
@@ -736,7 +749,8 @@ exports.exportToSheets = onSchedule(
           : 0;
 
         const imprest    = imprestMap.get(empId) || 0;
-        const totalDue   = parseFloat((salaryDue + covy + imprest).toFixed(2));
+        const settlement = parseFloat((settlementCashMap.get(user.id) || 0).toFixed(2));
+        const totalDue   = parseFloat((salaryDue + covy + imprest + settlement).toFixed(2));
 
         grandTotal += totalDue;
         grandCfBal += user.plBalance || 0;
@@ -753,6 +767,7 @@ exports.exportToSheets = onSchedule(
           salaryDue,
           covy,
           imprest,
+          settlement,
           totalDue,
         ]);
       });
