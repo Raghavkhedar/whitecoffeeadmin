@@ -1,5 +1,5 @@
 // Standalone tests for the OT/shortage/WO ledger math. Run: npx tsx src/lib/otLedger.test.ts
-import { computeDayLedger, netLedgerMins, WO_DEBIT_MINS, type DayLedger } from './otLedger';
+import { computeDayLedger, netLedgerMins, istMinuteOfDay, WO_DEBIT_MINS, type DayLedger } from './otLedger';
 
 let passed = 0;
 let failed = 0;
@@ -20,54 +20,75 @@ function eq(name: string, got: number, want: number) {
   else { failed++; console.log(`  ✗ ${name}: got ${got}, want ${want}`); }
 }
 
-const PLANNED = 480;   // 8h shift
-const DECLARED = 30;   // admin pre-declared 30 min OT
+const START = 10 * 60;   // 10:00
+const END   = 18 * 60;   // 18:00 (8h shift)
+const DECLARED = 30;     // admin pre-declared 30 min OT
+// Convenience: build a normal-day input from in/out minute-of-day.
+const day = (inMin: number, outMin: number, declaredOtMins = 0) =>
+  computeDayLedger({ shiftStartMin: START, shiftEndMin: END, inMin, outMin, declaredOtMins, isRestDay: false, otAuthorized: false });
 
-console.log('Normal working day (shift 480, declared 30):');
-// Out exactly at shift end: no OT, no shortage.
-check('worked 480 → on time', computeDayLedger({ plannedMins: PLANNED, declaredOtMins: 0, actualMins: 480, isRestDay: false, otAuthorized: false }),
+console.log('Normal working day (shift 10:00–18:00):');
+// Exactly on the window: no OT, no shortage.
+check('in 10:00 out 18:00 → on time', day(START, END),
   { shortageMins: 0, autoOtMins: 0, pendingExtraMins: 0 });
-// Worked exactly the declared OT → all auto-approved, no pending, no shortage.
-check('480+30 declared → +30 auto, 0 pending, 0 shortage', computeDayLedger({ plannedMins: PLANNED, declaredOtMins: DECLARED, actualMins: 510, isRestDay: false, otAuthorized: false }),
+// Stayed 30 late with 30 declared → all auto-approved, no pending, no shortage.
+check('out 18:30, declared 30 → +30 auto, 0 pending', day(START, END + 30, DECLARED),
   { autoOtMins: 30, pendingExtraMins: 0, shortageMins: 0 });
-// Partial declared (worked 15 of 30): +15 auto, NO new shortage (key correctness case).
-check('495 (15 of 30 declared) → +15 auto, 0 pending, 0 shortage', computeDayLedger({ plannedMins: PLANNED, declaredOtMins: DECLARED, actualMins: 495, isRestDay: false, otAuthorized: false }),
+// Stayed 15 late of 30 declared → +15 auto, no pending.
+check('out 18:15, declared 30 → +15 auto, 0 pending', day(START, END + 15, DECLARED),
   { autoOtMins: 15, pendingExtraMins: 0, shortageMins: 0 });
-// Beyond declared (worked 60, declared 30): +30 auto, +30 pending review.
-check('540 (declared 30) → +30 auto, +30 pending', computeDayLedger({ plannedMins: PLANNED, declaredOtMins: DECLARED, actualMins: 540, isRestDay: false, otAuthorized: false }),
+// Stayed 60 late, declared 30 → +30 auto, +30 pending.
+check('out 19:00, declared 30 → +30 auto, +30 pending', day(START, END + 60, DECLARED),
   { autoOtMins: 30, pendingExtraMins: 30, shortageMins: 0 });
-// Left before shift end: shortage vs the plain shift, no OT.
-check('465 (under shift) → 15 shortage, 0 OT', computeDayLedger({ plannedMins: PLANNED, declaredOtMins: DECLARED, actualMins: 465, isRestDay: false, otAuthorized: false }),
+// Left 15 early → 15 shortage, no OT (declared is a ceiling on OT, not a shortage waiver).
+check('out 17:45 → 15 shortage, 0 OT', day(START, END - 15, DECLARED),
   { shortageMins: 15, autoOtMins: 0, pendingExtraMins: 0 });
-// Overtime with NO declaration: all surplus is pending review (nothing auto).
-check('540 (no declaration) → 0 auto, +60 pending', computeDayLedger({ plannedMins: PLANNED, declaredOtMins: 0, actualMins: 540, isRestDay: false, otAuthorized: false }),
+// Stayed 60 late with NO declaration → all pending.
+check('out 19:00, no declaration → 0 auto, +60 pending', day(START, END + 60, 0),
   { autoOtMins: 0, pendingExtraMins: 60, shortageMins: 0 });
 
+console.log('\nEdges: early-in earns NOTHING; only late-out is OT:');
+// Came 10 early AND left 4 early → early-in ignored, 4 shortage, 0 OT. (devendra)
+check('in 09:50 out 17:56 → 0 OT + 4 shortage', day(START - 10, END - 4, 0),
+  { pendingExtraMins: 0, shortageMins: 4, autoOtMins: 0 });
+// Came an hour early, left exactly on time → nothing at all.
+check('in 09:00 out 18:00 → 0 OT, 0 shortage', day(START - 60, END, 0),
+  { pendingExtraMins: 0, autoOtMins: 0, shortageMins: 0 });
+// Came 20 late AND left 30 late → 20 shortage (late-in) AND 30 OT (late-out), independent.
+check('in 10:20 out 18:30 → 20 shortage + 30 OT', day(START + 20, END + 30, 0),
+  { shortageMins: 20, pendingExtraMins: 30 });
+// Came 15 early AND left 15 late → early-in ignored, only 15 late-out OT.
+check('in 09:45 out 18:15 → 15 OT (late-out only), 0 shortage', day(START - 15, END + 15, 0),
+  { pendingExtraMins: 15, shortageMins: 0 });
+
 console.log('\nRest day (Sunday/holiday):');
-// Authorized → every worked minute is auto-approved OT, no shortage.
-check('authorized, worked 300 → +300 rest-day OT', computeDayLedger({ plannedMins: 0, declaredOtMins: 0, actualMins: 300, isRestDay: true, otAuthorized: true }),
+// Authorized → every worked minute is auto-approved OT (out − in), no shortage.
+check('authorized, 10:00–15:00 → +300 rest-day OT',
+  computeDayLedger({ shiftStartMin: 0, shiftEndMin: 0, inMin: START, outMin: 15 * 60, declaredOtMins: 0, isRestDay: true, otAuthorized: true }),
   { restDayOtMins: 300, shortageMins: 0, autoOtMins: 0, pendingExtraMins: 0, unauthorizedRestDay: false });
-// Not authorized → 0 OT, flagged as unauthorized (no shortage either).
-check('unauthorized, worked 300 → 0 OT, flagged', computeDayLedger({ plannedMins: 0, declaredOtMins: 0, actualMins: 300, isRestDay: true, otAuthorized: false }),
+// Not authorized → 0 OT, flagged, no shortage.
+check('unauthorized, 10:00–15:00 → 0 OT, flagged',
+  computeDayLedger({ shiftStartMin: 0, shiftEndMin: 0, inMin: START, outMin: 15 * 60, declaredOtMins: 0, isRestDay: true, otAuthorized: false }),
   { restDayOtMins: 0, unauthorizedRestDay: true, shortageMins: 0 });
-// Rest day takes priority even if a shift somehow exists.
-check('rest day ignores any shift (authorized 600)', computeDayLedger({ plannedMins: 480, declaredOtMins: 0, actualMins: 600, isRestDay: true, otAuthorized: true }),
+// Rest day ignores any shift window.
+check('rest day ignores shift (authorized 10:00–20:00)',
+  computeDayLedger({ shiftStartMin: START, shiftEndMin: END, inMin: START, outMin: 20 * 60, declaredOtMins: 0, isRestDay: true, otAuthorized: true }),
   { restDayOtMins: 600, shortageMins: 0 });
 
-console.log('\nNo shift, not a rest day (ops, no plan):');
-check('no plan → nothing accrues', computeDayLedger({ plannedMins: 0, declaredOtMins: 0, actualMins: 400, isRestDay: false, otAuthorized: false }),
+console.log('\nNo shift, not a rest day:');
+check('no shift → nothing accrues',
+  computeDayLedger({ shiftStartMin: 0, shiftEndMin: 0, inMin: START, outMin: END, declaredOtMins: 0, isRestDay: false, otAuthorized: false }),
   { shortageMins: 0, autoOtMins: 0, pendingExtraMins: 0, restDayOtMins: 0 });
 
+console.log('\nistMinuteOfDay (epoch secs → IST minute-of-day):');
+eq('2026-06-01 09:50 IST → 590', istMinuteOfDay(Math.floor(new Date('2026-06-01T09:50:00+05:30').getTime() / 1000)), 590);
+eq('2026-06-01 17:56 IST → 1076', istMinuteOfDay(Math.floor(new Date('2026-06-01T17:56:00+05:30').getTime() / 1000)), 17 * 60 + 56);
+
 console.log('\nNet ledger:');
-// "Offset a pre-existing shortage" story: prior 30 shortage, today +15 auto OT → net -15.
 eq('prior shortage 30, +15 OT → net -15', netLedgerMins({ autoOtMins: 15, restDayOtMins: 0, approvedGrantedMins: 0, shortageMins: 30, woDebitMins: 0 }), -15);
-// WO debit: one WO day unworked → -480.
 eq('1 WO day, no OT → net -480', netLedgerMins({ autoOtMins: 0, restDayOtMins: 0, approvedGrantedMins: 0, shortageMins: 0, woDebitMins: WO_DEBIT_MINS }), -480);
-// WO worked off by a full rest-day shift → net 0.
 eq('1 WO day + 480 rest-day OT → net 0', netLedgerMins({ autoOtMins: 0, restDayOtMins: 480, approvedGrantedMins: 0, shortageMins: 0, woDebitMins: WO_DEBIT_MINS }), 0);
-// WO worked off only 5h (300) → net -180 (the 3h shortage from your example).
 eq('1 WO day + 300 rest-day OT → net -180', netLedgerMins({ autoOtMins: 0, restDayOtMins: 300, approvedGrantedMins: 0, shortageMins: 0, woDebitMins: WO_DEBIT_MINS }), -180);
-// Mixed: 60 auto + 120 granted + 480 rest-day − 90 shortage − 480 WO → +90.
 eq('mixed → +90', netLedgerMins({ autoOtMins: 60, restDayOtMins: 480, approvedGrantedMins: 120, shortageMins: 90, woDebitMins: 480 }), 90);
 
 console.log(`\n${failed === 0 ? '✅' : '❌'} ${passed} passed, ${failed} failed`);

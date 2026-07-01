@@ -9,7 +9,7 @@ import { RoleBadge } from '@/components/ui';
 import ExportButton from '@/components/ExportButton';
 import { downloadSheet } from '@/lib/excel';
 import { istTodayStr, istDaysAgoStr } from '@/lib/date';
-import { computeDayLedger, netLedgerMins, WO_DEBIT_MINS } from '@/lib/otLedger';
+import { computeDayLedger, netLedgerMins, WO_DEBIT_MINS, istMinuteOfDay, DEFAULT_SHIFT_START_MIN, DEFAULT_SHIFT_END_MIN } from '@/lib/otLedger';
 
 // ── Date range helpers ────────────────────────────────────────────────────────
 
@@ -119,13 +119,13 @@ const OPS_OUT_TYPES = new Set(['site_out', 'market_out']);
 interface DayDetail {
   date: string;
   plannedMins: number;      // shift window
-  plannedStart: string;     // shift start "HH:MM" (ops) — '' if none
-  plannedEnd: string;       // shift end "HH:MM" (ops) — '' if none
+  plannedStart: string;     // effective shift start "HH:MM" (default "10:00" when no valid plan)
+  plannedEnd: string;       // effective shift end "HH:MM" (default "18:00" when no valid plan)
   declaredOtMins: number;   // admin pre-declared OT for the day
   actualMins: number;
   autoOtMins: number;       // pre-authorized OT actually worked = min(surplus, declared) → no review
   pendingExtraMins: number; // surplus beyond declared → needs admin review
-  shortageMins: number;     // max(0, planned − actual) — measured vs the plain shift
+  shortageMins: number;     // late-in + early-out (edges scored independently, no cancelling)
   restDayOtMins: number;    // Sunday/holiday: all worked minutes when authorized → auto-approved OT
   isRestDay: boolean;       // Sunday or company holiday
   firstInSecs: number;
@@ -220,10 +220,13 @@ function aggregateForEmployee(
 
     const restDay     = isSunday(date) || holidays.has(date);
     const planInfo    = isOps ? plannedByDate.get(date) : { planned: OFFICE_DAY_MINS, declared: 0, startTime: '10:00', endTime: '18:00' };
-    const plannedDay  = planInfo?.planned ?? 0;
+    // No valid plan for an ops worked day → fall back to the default 10:00–18:00 shift.
+    const shiftStartMin = planInfo ? hhmmToMinutes(planInfo.startTime) : DEFAULT_SHIFT_START_MIN;
+    const shiftEndMin   = planInfo ? hhmmToMinutes(planInfo.endTime)   : DEFAULT_SHIFT_END_MIN;
+    const plannedDay  = shiftEndMin - shiftStartMin;
     const declaredDay = planInfo?.declared ?? 0;
     const detail: DayDetail = {
-      date, plannedMins: plannedDay, plannedStart: planInfo?.startTime ?? '', plannedEnd: planInfo?.endTime ?? '',
+      date, plannedMins: plannedDay, plannedStart: planInfo?.startTime ?? '10:00', plannedEnd: planInfo?.endTime ?? '18:00',
       declaredOtMins: declaredDay, actualMins: dayMins,
       autoOtMins: 0, pendingExtraMins: 0, shortageMins: 0, restDayOtMins: 0, isRestDay: restDay,
       firstInSecs: firstIn, lastOutSecs: lastOut, regularized,
@@ -231,7 +234,9 @@ function aggregateForEmployee(
 
     if (isOps) {
       const led = computeDayLedger({
-        plannedMins: plannedDay, declaredOtMins: declaredDay, actualMins: dayMins,
+        shiftStartMin, shiftEndMin,
+        inMin: istMinuteOfDay(firstIn), outMin: istMinuteOfDay(lastOut),
+        declaredOtMins: declaredDay,
         isRestDay: restDay, otAuthorized: otAuthByDate.has(date),
       });
       detail.shortageMins     = led.shortageMins;

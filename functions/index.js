@@ -227,8 +227,10 @@ exports.computeDailyAttendanceStatus = onSchedule(
 
       // Working window: office is fixed 10:00–18:00; operations use the planned
       // start/end the admin entered for the day.
-      const startMin = isOps ? toMinutes(plan?.startTime, 10 * 60) : 10 * 60;
-      const endMin   = isOps ? toMinutes(plan?.endTime,   18 * 60) : 18 * 60;
+      let startMin = isOps ? toMinutes(plan?.startTime, 10 * 60) : 10 * 60;
+      let endMin   = isOps ? toMinutes(plan?.endTime,   18 * 60) : 18 * 60;
+      // Inverted/zero window (e.g. a mis-entered "06:00" end meaning 6 PM) → fall back to 10:00–18:00.
+      if (endMin <= startMin) { startMin = 10 * 60; endMin = 18 * 60; }
 
       // Operations: in/out come from the first place they reached and the last
       // they left, across site and market visits. Office: office_in / office_out.
@@ -281,8 +283,9 @@ exports.computeDailyAttendanceStatus = onSchedule(
         const outMin      = getHourIST(lastOut.timestamp) * 60 + getMinuteIST(lastOut.timestamp);
         const actualMins  = Math.max(0, outMin - inMin);
         const plannedMins = Math.max(0, endMin - startMin);
-        const shortageMins = Math.max(0, plannedMins - actualMins);
-        const otMins       = Math.max(0, actualMins - plannedMins);
+        // Shortage = late-in + early-out; OT = late-out only (arriving early never earns OT).
+        const shortageMins = Math.max(0, inMin - startMin) + Math.max(0, endMin - outMin);
+        const otMins       = Math.max(0, outMin - endMin);
 
         // Per-day canonical record (the OT/shortage ledger reads this, not a lifetime counter).
         batch.set(db.doc(`users/${user.id}/daily_hours/${today}`), {

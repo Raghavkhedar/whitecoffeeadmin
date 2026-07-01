@@ -7,19 +7,20 @@ function eq(name: string, got: number | string, want: number | string) {
   else { failed++; console.log(`  ✗ ${name}: got ${got}, want ${want}`); }
 }
 
-// Build attendance in/out events. secs is minutes-from-an-epoch for simple deltas.
-const ev = (userId: string, date: string, type: string, mins: number) =>
-  ({ id: `${date}-${type}`, userId, date, type, timestamp: { seconds: mins * 60 } } as never);
+// Build an attendance event at a real IST wall-clock time (the ledger reads timestamps as IST).
+const ev = (userId: string, date: string, type: string, hhmm: string) =>
+  ({ id: `${date}-${type}-${hhmm}`, userId, date, type,
+     timestamp: { seconds: Math.floor(new Date(`${date}T${hhmm}:00+05:30`).getTime() / 1000) } } as never);
 
 const U = 'u1';
 const noHol = new Set<string>();
 
 // 2026-06-01 is a Monday (normal day). Shift 10:00–18:00 (480) + declared 30.
-// Worked 09:?: use site_in at minute 0, site_out at minute 540 → 540 worked = 60 surplus.
+// In 10:00, out 19:00 → 60 min late-out OT (auto 30 up to declared, 30 pending), no shortage.
 const planNormal = [{ id: '2026-06-01', userId: U, date: '2026-06-01', startTime: '10:00', endTime: '18:00', declaredOtMins: 30 } as never];
-const evNormal = [ev(U, '2026-06-01', 'site_in', 0), ev(U, '2026-06-01', 'site_out', 540)];
+const evNormal = [ev(U, '2026-06-01', 'site_in', '10:00'), ev(U, '2026-06-01', 'site_out', '19:00')];
 
-console.log('Normal day (480 shift, declared 30, worked 540):');
+console.log('Normal day (10:00–18:00 shift, declared 30, worked 10:00–19:00):');
 let r = computeRangeLedger(U, evNormal, planNormal, [], [], noHol);
 eq('autoOt = 30', r.autoOtMins, 30);
 eq('pending = 30', r.pendingOtMins, 30);
@@ -36,7 +37,7 @@ eq('net = 60 (auto 30 + granted 30)', r.netMins, 60);
 
 console.log('\nSunday rest-day work (2026-06-07 is a Sunday), authorized, worked 300:');
 const planSun = [{ id: '2026-06-07', userId: U, date: '2026-06-07', startTime: '', endTime: '', otAuthorized: true } as never];
-const evSun = [ev(U, '2026-06-07', 'site_in', 0), ev(U, '2026-06-07', 'site_out', 300)];
+const evSun = [ev(U, '2026-06-07', 'site_in', '10:00'), ev(U, '2026-06-07', 'site_out', '15:00')];
 r = computeRangeLedger(U, evSun, planSun, [], [], noHol);
 eq('restDayOt = 300', r.restDayOtMins, 300);
 eq('net = 300', r.netMins, 300);
@@ -77,6 +78,28 @@ const manualAppr = [{ id: '2026-06-04', userId: U, date: '2026-06-04', approvedM
 r = computeRangeLedger(U, [], [], manualAppr, [], noHol);
 eq('granted = 120', r.grantedOtMins, 120);
 eq('net = 120', r.netMins, 120);
+
+console.log('\nEarly-in earns nothing (2026-06-08 Mon, shift 10:00–18:00, in 09:50 out 17:56):');
+// Early-in 10m → ignored (no OT); early-out 4m → shortage.
+const evDev = [ev(U, '2026-06-08', 'site_in', '09:50'), ev(U, '2026-06-08', 'site_out', '17:56')];
+const planDev = [{ id: '2026-06-08', userId: U, date: '2026-06-08', startTime: '10:00', endTime: '18:00', declaredOtMins: 0 } as never];
+r = computeRangeLedger(U, evDev, planDev, [], [], noHol);
+eq('early-in OT = 0', r.pendingOtMins, 0);
+eq('early-out shortage = 4', r.shortageMins, 4);
+eq('net = -4 (shortage only)', r.netMins, -4);
+
+console.log('\nOps with NO plan → falls back to default 10:00–18:00 (2026-06-09 Tue, worked 10:00–19:00):');
+const evNoPlan = [ev(U, '2026-06-09', 'site_in', '10:00'), ev(U, '2026-06-09', 'site_out', '19:00')];
+r = computeRangeLedger(U, evNoPlan, [], [], [], noHol);
+eq('default shift → 60 pending OT', r.pendingOtMins, 60);
+eq('default shift → 0 shortage', r.shortageMins, 0);
+
+console.log('\nInverted window "06:00" end → treated as no plan → default 10:00–18:00 (devendra bug, 2026-06-10 Wed):');
+const evInv = [ev(U, '2026-06-10', 'site_in', '09:50'), ev(U, '2026-06-10', 'site_out', '17:56')];
+const planInv = [{ id: '2026-06-10', userId: U, date: '2026-06-10', startTime: '10:00', endTime: '06:00', declaredOtMins: 0 } as never];
+r = computeRangeLedger(U, evInv, planInv, [], [], noHol);
+eq('inverted → default → OT 0 (early-in ignored)', r.pendingOtMins, 0);
+eq('inverted → default → shortage 4', r.shortageMins, 4);
 
 console.log('\nsettlementCash (rate ₹800/day):');
 eq('unworked WO → 0', settlementCash(800, 1, -480), 0);              // +800 − 800

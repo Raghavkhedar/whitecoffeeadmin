@@ -3,7 +3,10 @@
 // domain types below are `import type`, so they're erased at runtime).
 
 import type { AttendanceRecord, PlannedHours, OtApproval, AttendanceStatus } from '@/types';
-import { computeDayLedger, netLedgerMins, WO_DEBIT_MINS } from './otLedger';
+import {
+  computeDayLedger, netLedgerMins, WO_DEBIT_MINS, istMinuteOfDay,
+  DEFAULT_SHIFT_START_MIN, DEFAULT_SHIFT_END_MIN,
+} from './otLedger';
 
 const OPS_IN_TYPES  = new Set(['site_in', 'market_in']);
 const OPS_OUT_TYPES = new Set(['site_out', 'market_out']);
@@ -42,11 +45,13 @@ export function computeRangeLedger(
   statuses: AttendanceStatus[],
   holidays: Set<string>,
 ): RangeLedger {
-  const plannedByDate = new Map<string, { planned: number; declared: number }>();
+  // Only windows with end > start are valid; an inverted/zero window (e.g. a mis-entered
+  // "06:00" end) is treated as no plan → the worked day falls back to the default 10:00–18:00.
+  const plannedByDate = new Map<string, { startMin: number; endMin: number; declared: number }>();
   const otAuthByDate = new Set<string>();
   planned.filter(p => p.userId === userId).forEach(p => {
-    const dur = hhmmToMinutes(p.endTime) - hhmmToMinutes(p.startTime);
-    if (dur > 0) plannedByDate.set(p.date, { planned: dur, declared: Math.max(0, p.declaredOtMins ?? 0) });
+    const startMin = hhmmToMinutes(p.startTime), endMin = hhmmToMinutes(p.endTime);
+    if (endMin > startMin) plannedByDate.set(p.date, { startMin, endMin, declared: Math.max(0, p.declaredOtMins ?? 0) });
     if (p.otAuthorized) otAuthByDate.add(p.date);
   });
 
@@ -61,22 +66,23 @@ export function computeRangeLedger(
 
   // Regularized-to-Present days carry an effective in/out captured by the admin (missed-punch
   // fix). These override raw events for the date so the corrected day can carry shortage/OT.
-  const overrideByDate = new Map<string, number>(); // date → worked minutes
+  const overrideByDate = new Map<string, { inMin: number; outMin: number }>(); // date → effective in/out (IST min-of-day)
   statuses.filter(s => s.userId === userId && s.status === 'Present' && s.inTime && s.outTime).forEach(s => {
-    const mins = hhmmToMinutes(s.outTime) - hhmmToMinutes(s.inTime);
-    if (mins > 0) overrideByDate.set(s.date, mins);
+    const inMin = hhmmToMinutes(s.inTime), outMin = hhmmToMinutes(s.outTime);
+    if (outMin > inMin) overrideByDate.set(s.date, { inMin, outMin });
   });
 
   let autoOtMins = 0, restDayOtMins = 0, shortageMins = 0, pendingOtMins = 0;
   const pendingDates: string[] = [];
   const unauthorizedRestDates: string[] = [];
 
-  const accrueDay = (date: string, dayMins: number) => {
+  const accrueDay = (date: string, inMin: number, outMin: number) => {
     const info = plannedByDate.get(date);
     const led = computeDayLedger({
-      plannedMins: info?.planned ?? 0,
+      shiftStartMin: info?.startMin ?? DEFAULT_SHIFT_START_MIN,
+      shiftEndMin:   info?.endMin   ?? DEFAULT_SHIFT_END_MIN,
+      inMin, outMin,
       declaredOtMins: info?.declared ?? 0,
-      actualMins: dayMins,
       isRestDay: isSunday(date) || holidays.has(date),
       otAuthorized: otAuthByDate.has(date),
     });
@@ -96,10 +102,10 @@ export function computeRangeLedger(
     const lastOut = outs.length ? Math.max(...outs.map(tsSeconds)) : null;
     if (lastOut === null || lastOut <= firstIn) return; // open/invalid day
 
-    accrueDay(date, Math.round((lastOut - firstIn) / 60));
+    accrueDay(date, istMinuteOfDay(firstIn), istMinuteOfDay(lastOut));
   });
 
-  overrideByDate.forEach((mins, date) => accrueDay(date, mins));
+  overrideByDate.forEach(({ inMin, outMin }, date) => accrueDay(date, inMin, outMin));
 
   const grantedOtMins = Array.from(apprByDate.values()).reduce((s, a) => s + (Number(a.approvedMins) || 0), 0);
   const woDates = statuses.filter(s => s.userId === userId && s.status === 'WO').map(s => s.date).sort();

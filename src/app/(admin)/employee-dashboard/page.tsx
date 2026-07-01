@@ -9,7 +9,7 @@ import { RoleBadge } from '@/components/ui';
 import ExportButton from '@/components/ExportButton';
 import { downloadSheet } from '@/lib/excel';
 import { istTodayStr, istDaysAgoStr } from '@/lib/date';
-import { computeDayLedger } from '@/lib/otLedger';
+import { computeDayLedger, istMinuteOfDay, DEFAULT_SHIFT_START_MIN, DEFAULT_SHIFT_END_MIN } from '@/lib/otLedger';
 
 // ── Date range helpers ────────────────────────────────────────────────────────
 
@@ -140,11 +140,11 @@ function aggregateForEmployee(
   const userEvents = allEvents.filter(e => e.userId === user.id);
 
   // Planned shift + declared-OT minutes per date (ops use admin-set windows; office/admin fixed 8h)
-  const plannedByDate = new Map<string, { planned: number; declared: number }>();
+  const plannedByDate = new Map<string, { planned: number; declared: number; startTime: string; endTime: string }>();
   const otAuthByDate = new Set<string>(); // dates with admin-authorized rest-day OT
   plannedItems.filter(p => p.userId === user.id).forEach(p => {
     const dur = hhmmToMinutes(p.endTime) - hhmmToMinutes(p.startTime);
-    if (dur > 0) plannedByDate.set(p.date, { planned: dur, declared: Math.max(0, p.declaredOtMins ?? 0) });
+    if (dur > 0) plannedByDate.set(p.date, { planned: dur, declared: Math.max(0, p.declaredOtMins ?? 0), startTime: p.startTime, endTime: p.endTime });
     if (p.otAuthorized) otAuthByDate.add(p.date);
   });
 
@@ -186,14 +186,17 @@ function aggregateForEmployee(
     // Otherwise (normal working day with a shift): declared OT is a pre-approval ceiling, not an
     // obligation — shortage is vs the plain shift; OT up to declared is auto-approved, beyond needs review.
     const restDay     = new Date(date + 'T12:00:00').getDay() === 0 || holidays.has(date);
-    const planInfo    = isOps ? plannedByDate.get(date) : { planned: OFFICE_DAY_MINS, declared: 0 };
-    const plannedDay  = planInfo?.planned ?? 0;
-    const declaredDay = planInfo?.declared ?? 0;
-    // Office/admin never accrue OT/shortage here (scope: ops only).
+    const planInfo    = isOps ? plannedByDate.get(date) : undefined;
+    // Ops: admin window, or the default 10:00–18:00 when no valid plan. Office/admin: fixed 10:00–18:00.
+    const shiftStartMin = isOps && planInfo ? hhmmToMinutes(planInfo.startTime) : DEFAULT_SHIFT_START_MIN;
+    const shiftEndMin   = isOps && planInfo ? hhmmToMinutes(planInfo.endTime)   : DEFAULT_SHIFT_END_MIN;
+    const plannedDay    = shiftEndMin - shiftStartMin;
+    const declaredDay   = planInfo?.declared ?? 0;
+    const inMin = istMinuteOfDay(firstIn), outMin = istMinuteOfDay(lastOut);
     if (isOps) {
       const led = computeDayLedger({
-        plannedMins: plannedDay, declaredOtMins: declaredDay, actualMins: dayMins,
-        isRestDay: restDay, otAuthorized: otAuthByDate.has(date),
+        shiftStartMin, shiftEndMin, inMin, outMin,
+        declaredOtMins: declaredDay, isRestDay: restDay, otAuthorized: otAuthByDate.has(date),
       });
       shortageMins    += led.shortageMins;
       autoOtRangeMins += led.autoOtMins;
@@ -201,9 +204,10 @@ function aggregateForEmployee(
       if (led.pendingExtraMins > 0) {
         otDays.push({ date, plannedMins: plannedDay, declaredOtMins: declaredDay, actualMins: dayMins, autoOtMins: led.autoOtMins, pendingExtraMins: led.pendingExtraMins });
       }
-    } else if (plannedDay > 0 && !restDay) {
-      // Office/admin: shortage only, vs the fixed 8h window (no OT, no rest-day, no holidays).
-      shortageMins += Math.max(0, plannedDay - dayMins);
+    } else if (!restDay) {
+      // Office/admin: shortage only, edge-based vs the fixed 10:00–18:00 window (early in never
+      // offsets early out); no OT, no rest-day, no holidays.
+      shortageMins += Math.max(0, inMin - shiftStartMin) + Math.max(0, shiftEndMin - outMin);
     }
   };
 

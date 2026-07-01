@@ -258,6 +258,13 @@ export default function AttendancePage() {
     const planned = plannedByDate.get(date)?.get(userId);
     if (!planned?.startTime || !planned?.endTime) return;
 
+    // Guard against an inverted window (e.g. entering "06:00" as the end meaning 6 PM). A shift
+    // whose end is not after its start would silently drop the day from the OT/shortage ledger.
+    if (hhmmToMinutes(planned.endTime, 0) <= hhmmToMinutes(planned.startTime, 0)) {
+      setSaveError(`Shift end (${planned.endTime}) must be after start (${planned.startTime}). Times are 24-hour — use 18:00 for 6 PM.`);
+      return;
+    }
+
     setSaving(prev => ({ ...prev, [key]: true }));
     setSaveError('');
     try {

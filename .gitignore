@@ -11,3 +11,10 @@ functions/conveyance-calc.js
 skills-lock.json
 tsconfig.tsbuildinfo
 graphify-out/
+
+# Service-account keys — NEVER commit
+white-coffee-*.json
+*-firebase-adminsdk-*.json
+serviceAccount*.json
+# one-off maintenance script
+functions/cleanup-preprod.js
