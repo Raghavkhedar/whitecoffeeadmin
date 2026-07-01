@@ -6,6 +6,7 @@ import { RoleBadge, StatusBadge } from '@/components/ui';
 import ExportButton from '@/components/ExportButton';
 import { downloadSheet } from '@/lib/excel';
 import { istTodayStr } from '@/lib/date';
+import { LAUNCH_DATE } from '@/lib/config';
 import { auth } from '@/lib/firebase';
 
 const DAYS_OF_WEEK = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -83,6 +84,7 @@ function deriveStatus(
   date: string,
   planned?: PlannedHours,
 ): AttendanceStatus['status'] | null {
+  if (date < LAUNCH_DATE) return null; // pre-launch (test data wiped) — never render a status
   const dayOfWeek = new Date(date + 'T00:00:00').getDay();
   if (dayOfWeek === 0) return null; // Sunday — no status
 

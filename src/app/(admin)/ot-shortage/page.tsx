@@ -10,6 +10,7 @@ import ExportButton from '@/components/ExportButton';
 import { downloadSheet } from '@/lib/excel';
 import { istTodayStr, istDaysAgoStr } from '@/lib/date';
 import { computeDayLedger, netLedgerMins, WO_DEBIT_MINS, istMinuteOfDay, DEFAULT_SHIFT_START_MIN, DEFAULT_SHIFT_END_MIN } from '@/lib/otLedger';
+import { LAUNCH_DATE } from '@/lib/config';
 
 // ── Date range helpers ────────────────────────────────────────────────────────
 
@@ -57,6 +58,7 @@ function isSunday(date: string): boolean {
 
 // Count Mon–Sat days (no Sundays, no company holidays) in a date range, inclusive.
 function countWorkingDays(start: string, end: string, holidays: Set<string>): number {
+  if (start < LAUNCH_DATE) start = LAUNCH_DATE; // ignore pre-launch (wiped) dates
   let count = 0;
   const d = new Date(start + 'T12:00:00');
   const e = new Date(end + 'T12:00:00');
